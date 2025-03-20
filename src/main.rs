@@ -1,27 +1,22 @@
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
-use swayipc::{Connection, Workspace};
+use swayipc::{Connection, Floating};
 
-fn get_focused_workspace(con: &mut Connection) -> Option<Workspace> {
-    let workspaces = con.get_workspaces().unwrap();
-    workspaces.into_iter().find(|w| w.focused)
+fn find_working_area_for(con: &mut Connection, node_id: i64) -> Option<swayipc::Rect> {
+    Some(con.get_workspaces().unwrap().iter().find(|w| w.focus.contains(&node_id))?.rect)
 }
 
-fn find_working_area(con: &mut Connection) -> Option<swayipc::Rect> {
-    Some(get_focused_workspace(con)?.rect)
-}
-
-fn move_window_to_position(con: &mut Connection, x: i32, y: i32) {
-    let cmd = format!("move position {} {}", x, y);
+fn move_node_to_position(con: &mut Connection, node_id: i64, x: i32, y: i32) {
+    let cmd = format!(r#"[con_id="{}"] move position {} {}"#, node_id, x, y);
     con.run_command(cmd).unwrap();
 }
 
-fn resize_window(con: &mut Connection, width: u32, height: u32) {
-    let cmd = format!("resize set {} px {} px", width, height);
+fn resize_node(con: &mut Connection, node_id: i64, width: u32, height: u32) {
+    let cmd = format!(r#"[con_id="{}"] resize set {} px {} px"#, node_id, width, height);
     con.run_command(cmd).unwrap();
 }
 
-/// Move the focused window to the specified position
+/// Move a floating window to the specified position
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
@@ -29,7 +24,7 @@ struct Args {
     horizontal: Horizontal,
 
     #[arg(short, long, default_value_t = 0)]
-    margin: u32,
+    padding: u32,
 
     #[arg(long)]
     width: Option<u32>,
@@ -42,40 +37,52 @@ fn main() {
     let args = Args::parse();
     let mut con = Connection::new().unwrap();
 
-    let working_area: Rect = find_working_area(&mut con).unwrap().into();
-    let proper_area = working_area.with_margin(args.margin as i32);
-
     let tree = con.get_tree().unwrap();
-    let focused_node = tree.find_focused_as_ref(|node| node.focused).unwrap();
-    let mut rect: Rect = focused_node.rect.into();
+    let floating_nodes: Vec<_> = tree.iter().filter(|node| node.floating.is_some_and(|state| state == Floating::AutoOn || state == Floating::UserOn)).collect();
+    let target_node = match floating_nodes.len() {
+        1 => {
+            println!("Only one floating node found, using it");
+            floating_nodes[0]
+        },
+        _ => tree.find_focused_as_ref(|node| node.focused && node.floating.is_some_and(|state| state == Floating::AutoOn || state == Floating::UserOn)).unwrap(),
+    };
+
+    let working_area: Rect = find_working_area_for(&mut con, target_node.id).unwrap().into();
+    let proper_area = working_area.with_padding(args.padding as i32);
+
+    dbg!(&target_node);
+    let mut rect: Rect = target_node.rect.into();
+    // TODO: do this properly
+    rect.height += target_node.deco_rect.height;
 
     let (width, height) = match (args.width, args.height) {
         (Some(width), Some(height)) => {
-            resize_window(&mut con, width, height);
+            resize_node(&mut con, target_node.id, width, height);
             (width as i32, height as i32)
         },
         (Some(width), None) => {
             let rect = &rect.scale_to_match_width(width as i32);
-            resize_window(&mut con, rect.width as u32, rect.height as u32);
+            resize_node(&mut con, target_node.id, rect.width as u32, rect.height as u32);
             (rect.width, rect.height)
         },
         (None, Some(height)) => {
+            dbg!(height);
             let rect = &rect.scale_to_match_height(height as i32);
-            resize_window(&mut con, rect.width as u32, rect.height as u32);
+            resize_node(&mut con, target_node.id, rect.width as u32, rect.height as u32);
             (rect.width, rect.height)
         },
-        _ => (focused_node.rect.width, focused_node.rect.height),
+        _ => (target_node.rect.width, target_node.rect.height),
     };
     rect.height = height;
     rect.width = width;
 
     let pos = Position(args.vertical, args.horizontal);
     let rect = proper_area.get_pos_for_rect_of_size(pos, &rect);
-    // we added a margin to our working area, but the center of the new area is not the same as the
+    // we added a padding to our working area, but the center of the new area is not the same as the
     // center of the old area, so we need to adjust the position of the window
-    let final_pos = rect.translate(args.margin as i32, args.margin as i32);
+    let final_pos = rect.translate(args.padding as i32, args.padding as i32);
 
-    move_window_to_position(&mut con, final_pos.x, final_pos.y);
+    move_node_to_position(&mut con, target_node.id, final_pos.x, final_pos.y);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -92,13 +99,13 @@ impl Rect {
         Self { x, y, width, height }
     }
 
-    fn with_margin(&self, margin: i32) -> Self {
+    fn with_padding(&self, padding: i32) -> Self {
         let mut rect = *self;
 
-        rect.x += margin;
-        rect.y += margin;
-        rect.width -= margin * 2;
-        rect.height -= margin * 2;
+        rect.x += padding;
+        rect.y += padding;
+        rect.width -= padding * 2;
+        rect.height -= padding * 2;
 
         rect
     }
@@ -113,9 +120,13 @@ impl Rect {
     fn scale_to_match_height(&self, height: i32) -> Self {
         let mut rect = *self;
 
-        let ratio = height as f32 / rect.height as f32;
-        rect.width = (rect.width as f32 * ratio) as i32;
+        dbg!(rect.height);
+        dbg!(rect.width);
+        let ratio = rect.width as f32 / rect.height as f32;
+        dbg!(ratio);
+        rect.width = (height as f32 * ratio) as i32;
         rect.height = height;
+        dbg!(&rect);
 
         rect
     }
@@ -123,9 +134,13 @@ impl Rect {
     fn scale_to_match_width(&self, width: i32) -> Self {
         let mut rect = *self;
 
-        let ratio = width as f32 / rect.width as f32;
+        dbg!(rect.height);
+        dbg!(rect.width);
+        let ratio = rect.height as f32 / rect.width as f32;
+        dbg!(ratio);
         rect.width = width;
-        rect.height = (rect.height as f32 * ratio) as i32;
+        rect.height = (width as f32 * ratio) as i32;
+        dbg!(&rect);
 
         rect
     }
@@ -190,9 +205,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_rect_with_margin() {
+    fn test_rect_with_padding() {
         let rect = Rect::new(0, 0, 100, 100);
-        let rect = rect.with_margin(10);
+        let rect = rect.with_padding(10);
 
         assert_eq!(rect.x, 10);
         assert_eq!(rect.y, 10);
@@ -232,16 +247,31 @@ mod tests {
 
     #[test]
     fn test_scale_to_match_height() {
-        let rect = Rect::new(0, 0, 100, 50);
-        let rect = rect.scale_to_match_height(25);
+        let rect = Rect::new(0, 0, 200, 100);
+        let rect = rect.scale_to_match_height(50);
 
-        assert_eq!(rect.width, 50);
-        assert_eq!(rect.height, 25);
+        assert_eq!(rect.width, 100);
+        assert_eq!(rect.height, 50);
 
         let rect = Rect::new(0, 0, 100, 50);
         let rect = rect.scale_to_match_height(200);
 
         assert_eq!(rect.width, 400);
         assert_eq!(rect.height, 200);
+    }
+
+    #[test]
+    fn test_scale_to_match_width() {
+        let rect = Rect::new(0, 0, 200, 100);
+        let rect = rect.scale_to_match_width(400);
+
+        assert_eq!(rect.width, 400);
+        assert_eq!(rect.height, 200);
+
+        let rect = Rect::new(0, 0, 100, 50);
+        let rect = rect.scale_to_match_width(25);
+
+        assert_eq!(rect.width, 25);
+        assert_eq!(rect.height, 12);
     }
 }
