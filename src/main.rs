@@ -1,23 +1,57 @@
+use std::num::ParseIntError;
+
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
-use swayipc::{Connection, Floating, Fallible, Error as SwayIPCError};
+use sway::SwayConnection;
+use swayipc::{Error as SwayIPCError, NodeType};
 
-fn find_working_area_for(con: &mut Connection, node_id: i64) -> Fallible<Option<swayipc::Rect>> {
-    Ok(con.get_workspaces()?.iter().find(|w| w.focus.contains(&node_id)).map(|w| w.rect))
+mod sway;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum Vertical {
+    Top,
+    Middle,
+    Bottom,
 }
 
-fn move_node_to_position(con: &mut Connection, node_id: i64, x: i32, y: i32) -> Fallible<()> {
-    let cmd = format!(r#"[con_id="{}"] move position {} {}"#, node_id, x, y);
-    con.run_command(cmd)?;
-
-    Ok(())
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum Horizontal {
+    Left,
+    Middle,
+    Right,
 }
 
-fn resize_node(con: &mut Connection, node_id: i64, width: u32, height: u32) -> Fallible<()> {
-    let cmd = format!(r#"[con_id="{}"] resize set {} px {} px"#, node_id, width, height);
-    con.run_command(cmd)?;
+struct Position(Vertical, Horizontal);
 
-    Ok(())
+#[derive(Debug, Clone)]
+enum Unit {
+    Pixels(u32),
+    Percentage(u32),
+}
+
+impl std::str::FromStr for Unit {
+    type Err = ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(value) = s.strip_suffix("%") {
+            let value = value.parse()?;
+            Ok(Self::Percentage(value))
+        } else {
+            let value = s.parse()?;
+            Ok(Self::Pixels(value))
+        }
+    }
+}
+
+impl std::fmt::Display for Unit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pixels(value) => write!(f, "{} px", value),
+            Self::Percentage(value) => write!(f, "{} ppt", value),
+        }
+    }
 }
 
 /// Move a floating window to the specified position
@@ -41,6 +75,7 @@ struct Args {
 enum Error {
     SwayIPC(swayipc::Error),
     NoApplicableNode,
+    MultipleApplicableNodes,
 }
 
 impl std::fmt::Display for Error {
@@ -48,6 +83,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::SwayIPC(err) => write!(f, "SwayIPC error: {}", err),
             Error::NoApplicableNode => write!(f, "No applicable node found"),
+            Error::MultipleApplicableNodes => write!(f, "Multiple applicable nodes found"),
         }
     }
 }
@@ -67,19 +103,20 @@ fn main() {
 
 fn submain() -> Result<(), Error> {
     let args = Args::parse();
-    let mut con = Connection::new()?;
+    let mut con = SwayConnection::new()?;
 
     let tree = con.get_tree()?;
-    let floating_nodes: Vec<_> = tree.iter().filter(|node| node.floating.is_some_and(|state| state == Floating::AutoOn || state == Floating::UserOn)).collect();
+    let floating_nodes: Vec<_> = tree.iter().filter(|node| node.node_type == NodeType::FloatingCon).collect();
     let target_node = match floating_nodes.len() {
         1 => {
             println!("Only one floating node found, using it.");
             floating_nodes[0]
         },
-        _ => tree.find_focused_as_ref(|node| node.focused && node.floating.is_some_and(|state| state == Floating::AutoOn || state == Floating::UserOn)).ok_or(Error::NoApplicableNode)?,
+        0 => return Err(Error::NoApplicableNode),
+        _ => tree.find_focused_as_ref(|node| node.focused && node.node_type == NodeType::FloatingCon).ok_or(Error::MultipleApplicableNodes)?,
     };
 
-    let working_area = find_working_area_for(&mut con, target_node.id)?.map(Rect::from).ok_or(Error::NoApplicableNode)?;
+    let working_area = con.find_working_area_for(target_node.id)?.map(Rect::from).ok_or(Error::NoApplicableNode)?;
     let proper_area = working_area.with_padding(args.padding as i32);
 
     let mut rect: Rect = target_node.rect.into();
@@ -98,7 +135,7 @@ fn submain() -> Result<(), Error> {
         },
         _ => (target_node.rect.width, target_node.rect.height),
     };
-    resize_node(&mut con, target_node.id, width as u32, height as u32)?;
+    con.resize_node(target_node.id, Unit::Pixels(width as u32), Unit::Pixels(height as u32))?;
 
     rect.height = height;
     rect.width = width;
@@ -109,7 +146,7 @@ fn submain() -> Result<(), Error> {
     // center of the old area, so we need to adjust the position of the window
     let final_pos = rect.translate(args.padding as i32, args.padding as i32);
 
-    move_node_to_position(&mut con, target_node.id, final_pos.x, final_pos.y)?;
+    con.move_node_to_position(target_node.id, final_pos.x, final_pos.y)?;
 
     Ok(())
 }
@@ -124,7 +161,7 @@ struct Rect {
 
 
 impl Rect {
-    fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
+    fn _new(x: i32, y: i32, width: i32, height: i32) -> Self {
         Self { x, y, width, height }
     }
 
@@ -203,31 +240,13 @@ impl From<swayipc::Rect> for Rect {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-enum Vertical {
-    Top,
-    Middle,
-    Bottom,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-enum Horizontal {
-    Left,
-    Middle,
-    Right,
-}
-
-struct Position(Vertical, Horizontal);
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_rect_with_padding() {
-        let rect = Rect::new(0, 0, 100, 100);
+        let rect = Rect::_new(0, 0, 100, 100);
         let rect = rect.with_padding(10);
 
         assert_eq!(rect.x, 10);
@@ -238,8 +257,8 @@ mod tests {
 
     #[test]
     fn test_get_pos_for_rect_of_size() {
-        let workspace = Rect::new(0, 0, 100, 100);
-        let window = Rect::new(0, 0, 33, 33);
+        let workspace = Rect::_new(0, 0, 100, 100);
+        let window = Rect::_new(0, 0, 33, 33);
 
         let pos = Position(Vertical::Top, Horizontal::Left);
         let rect = workspace.get_pos_for_rect_of_size(pos, &window);
@@ -268,13 +287,13 @@ mod tests {
 
     #[test]
     fn test_scale_to_match_height() {
-        let rect = Rect::new(0, 0, 200, 100);
+        let rect = Rect::_new(0, 0, 200, 100);
         let rect = rect.scale_to_match_height(50);
 
         assert_eq!(rect.width, 100);
         assert_eq!(rect.height, 50);
 
-        let rect = Rect::new(0, 0, 100, 50);
+        let rect = Rect::_new(0, 0, 100, 50);
         let rect = rect.scale_to_match_height(200);
 
         assert_eq!(rect.width, 400);
@@ -283,13 +302,13 @@ mod tests {
 
     #[test]
     fn test_scale_to_match_width() {
-        let rect = Rect::new(0, 0, 200, 100);
+        let rect = Rect::_new(0, 0, 200, 100);
         let rect = rect.scale_to_match_width(400);
 
         assert_eq!(rect.width, 400);
         assert_eq!(rect.height, 200);
 
-        let rect = Rect::new(0, 0, 100, 50);
+        let rect = Rect::_new(0, 0, 100, 50);
         let rect = rect.scale_to_match_width(25);
 
         assert_eq!(rect.width, 25);
