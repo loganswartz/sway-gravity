@@ -1,19 +1,23 @@
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
-use swayipc::{Connection, Floating};
+use swayipc::{Connection, Floating, Fallible, Error as SwayIPCError};
 
-fn find_working_area_for(con: &mut Connection, node_id: i64) -> Option<swayipc::Rect> {
-    Some(con.get_workspaces().unwrap().iter().find(|w| w.focus.contains(&node_id))?.rect)
+fn find_working_area_for(con: &mut Connection, node_id: i64) -> Fallible<Option<swayipc::Rect>> {
+    Ok(con.get_workspaces()?.iter().find(|w| w.focus.contains(&node_id)).map(|w| w.rect))
 }
 
-fn move_node_to_position(con: &mut Connection, node_id: i64, x: i32, y: i32) {
+fn move_node_to_position(con: &mut Connection, node_id: i64, x: i32, y: i32) -> Fallible<()> {
     let cmd = format!(r#"[con_id="{}"] move position {} {}"#, node_id, x, y);
-    con.run_command(cmd).unwrap();
+    con.run_command(cmd)?;
+
+    Ok(())
 }
 
-fn resize_node(con: &mut Connection, node_id: i64, width: u32, height: u32) {
+fn resize_node(con: &mut Connection, node_id: i64, width: u32, height: u32) -> Fallible<()> {
     let cmd = format!(r#"[con_id="{}"] resize set {} px {} px"#, node_id, width, height);
-    con.run_command(cmd).unwrap();
+    con.run_command(cmd)?;
+
+    Ok(())
 }
 
 /// Move a floating window to the specified position
@@ -33,46 +37,69 @@ struct Args {
     height: Option<u32>,
 }
 
-fn main() {
-    let args = Args::parse();
-    let mut con = Connection::new().unwrap();
+#[derive(Debug)]
+enum Error {
+    SwayIPC(swayipc::Error),
+    NoApplicableNode,
+}
 
-    let tree = con.get_tree().unwrap();
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::SwayIPC(err) => write!(f, "SwayIPC error: {}", err),
+            Error::NoApplicableNode => write!(f, "No applicable node found"),
+        }
+    }
+}
+
+impl From<SwayIPCError> for Error {
+    fn from(err: SwayIPCError) -> Self {
+        Self::SwayIPC(err)
+    }
+}
+
+fn main() {
+    if let Err(e) = submain() {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+fn submain() -> Result<(), Error> {
+    let args = Args::parse();
+    let mut con = Connection::new()?;
+
+    let tree = con.get_tree()?;
     let floating_nodes: Vec<_> = tree.iter().filter(|node| node.floating.is_some_and(|state| state == Floating::AutoOn || state == Floating::UserOn)).collect();
     let target_node = match floating_nodes.len() {
         1 => {
-            println!("Only one floating node found, using it");
+            println!("Only one floating node found, using it.");
             floating_nodes[0]
         },
-        _ => tree.find_focused_as_ref(|node| node.focused && node.floating.is_some_and(|state| state == Floating::AutoOn || state == Floating::UserOn)).unwrap(),
+        _ => tree.find_focused_as_ref(|node| node.focused && node.floating.is_some_and(|state| state == Floating::AutoOn || state == Floating::UserOn)).ok_or(Error::NoApplicableNode)?,
     };
 
-    let working_area: Rect = find_working_area_for(&mut con, target_node.id).unwrap().into();
+    let working_area = find_working_area_for(&mut con, target_node.id)?.map(Rect::from).ok_or(Error::NoApplicableNode)?;
     let proper_area = working_area.with_padding(args.padding as i32);
 
-    dbg!(&target_node);
     let mut rect: Rect = target_node.rect.into();
     // TODO: do this properly
     rect.height += target_node.deco_rect.height;
 
     let (width, height) = match (args.width, args.height) {
-        (Some(width), Some(height)) => {
-            resize_node(&mut con, target_node.id, width, height);
-            (width as i32, height as i32)
-        },
+        (Some(width), Some(height)) => (width as i32, height as i32),
         (Some(width), None) => {
             let rect = &rect.scale_to_match_width(width as i32);
-            resize_node(&mut con, target_node.id, rect.width as u32, rect.height as u32);
             (rect.width, rect.height)
         },
         (None, Some(height)) => {
-            dbg!(height);
             let rect = &rect.scale_to_match_height(height as i32);
-            resize_node(&mut con, target_node.id, rect.width as u32, rect.height as u32);
             (rect.width, rect.height)
         },
         _ => (target_node.rect.width, target_node.rect.height),
     };
+    resize_node(&mut con, target_node.id, width as u32, height as u32)?;
+
     rect.height = height;
     rect.width = width;
 
@@ -82,7 +109,9 @@ fn main() {
     // center of the old area, so we need to adjust the position of the window
     let final_pos = rect.translate(args.padding as i32, args.padding as i32);
 
-    move_node_to_position(&mut con, target_node.id, final_pos.x, final_pos.y);
+    move_node_to_position(&mut con, target_node.id, final_pos.x, final_pos.y)?;
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -120,13 +149,9 @@ impl Rect {
     fn scale_to_match_height(&self, height: i32) -> Self {
         let mut rect = *self;
 
-        dbg!(rect.height);
-        dbg!(rect.width);
         let ratio = rect.width as f32 / rect.height as f32;
-        dbg!(ratio);
         rect.width = (height as f32 * ratio) as i32;
         rect.height = height;
-        dbg!(&rect);
 
         rect
     }
@@ -134,13 +159,9 @@ impl Rect {
     fn scale_to_match_width(&self, width: i32) -> Self {
         let mut rect = *self;
 
-        dbg!(rect.height);
-        dbg!(rect.width);
         let ratio = rect.height as f32 / rect.width as f32;
-        dbg!(ratio);
         rect.width = width;
         rect.height = (width as f32 * ratio) as i32;
-        dbg!(&rect);
 
         rect
     }
