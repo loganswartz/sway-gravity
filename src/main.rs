@@ -1,4 +1,4 @@
-use std::num::ParseIntError;
+use std::{env, fmt::Display, io::{self, Read, Write}, num::ParseIntError, os::unix::net::{UnixListener, UnixStream}, path::PathBuf, sync::LazyLock};
 
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -23,9 +23,10 @@ enum Horizontal {
     Right,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Position(Vertical, Horizontal);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum Unit {
     Pixels(u32),
     Percentage(f32),
@@ -81,6 +82,8 @@ impl std::fmt::Display for Unit {
     }
 }
 
+static DEFAULT_SOCKET: LazyLock<String> = LazyLock::new(|| format!("{}/sway-gravity/{}.sock", env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "./".to_string()), env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "sway".to_string())));
+
 /// Move a floating window to the specified position
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -88,69 +91,314 @@ struct Args {
     vertical: Vertical,
     horizontal: Horizontal,
 
-    #[arg(short, long, default_value_t = 0)]
-    padding: u32,
+    #[arg(short, long)]
+    padding: Option<u32>,
 
     #[arg(long)]
     width: Option<Unit>,
 
     #[arg(long)]
     height: Option<Unit>,
+
+    #[arg(short, long, default_value = DEFAULT_SOCKET.as_str())]
+    socket: PathBuf,
+
+    /// Run as a daemon, and wait for events via IPC
+    #[arg(short, long)]
+    daemon: bool,
+}
+
+#[derive(Debug, Clone)]
+struct State {
+    position: Position,
+    padding: u32,
+    width: Option<Unit>,
+    height: Option<Unit>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            position: Position(Vertical::Bottom, Horizontal::Right),
+            padding: 0,
+            width: None,
+            height: None,
+        }
+    }
+}
+
+impl State {
+    fn update(&mut self, update: StateUpdate) {
+        if let Some(position) = update.position {
+            self.position = position;
+        }
+        if let Some(padding) = update.padding {
+            self.padding = padding;
+        }
+        if let Some(width) = update.width {
+            self.width = width;
+        }
+        if let Some(height) = update.height {
+            self.height = height;
+        }
+    }
+
+    fn with(self, update: StateUpdate) -> Self {
+        let mut new_state = self.clone();
+        new_state.update(update);
+        new_state
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct StateUpdate {
+    position: Option<Position>,
+    padding: Option<u32>,
+    width: Option<Option<Unit>>,
+    height: Option<Option<Unit>>,
+}
+
+impl From<Args> for StateUpdate {
+    fn from(args: Args) -> Self {
+        Self {
+            position: Some(Position(args.vertical, args.horizontal)),
+            padding: args.padding,
+            width: Some(args.width),
+            height: Some(args.height),
+        }
+    }
+}
+
+impl From<State> for StateUpdate {
+    fn from(state: State) -> Self {
+        Self {
+            position: Some(state.position),
+            padding: Some(state.padding),
+            width: Some(state.width),
+            height: Some(state.height),
+        }
+    }
 }
 
 #[derive(Debug)]
-enum Error {
+enum StateUpdateError {
     SwayIPC(swayipc::Error),
     NoApplicableNode,
     MultipleApplicableNodes,
 }
 
-impl std::fmt::Display for Error {
+impl std::fmt::Display for StateUpdateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::SwayIPC(err) => write!(f, "SwayIPC error: {}", err),
-            Error::NoApplicableNode => write!(f, "No applicable node found"),
-            Error::MultipleApplicableNodes => write!(f, "Multiple applicable nodes found"),
+            StateUpdateError::SwayIPC(err) => write!(f, "SwayIPC error: {}", err),
+            StateUpdateError::NoApplicableNode => write!(f, "No applicable node found"),
+            StateUpdateError::MultipleApplicableNodes => write!(f, "Multiple applicable nodes found"),
         }
     }
 }
 
-impl From<SwayIPCError> for Error {
+impl From<SwayIPCError> for StateUpdateError {
     fn from(err: SwayIPCError) -> Self {
         Self::SwayIPC(err)
     }
 }
 
 fn main() {
-    if let Err(e) = submain() {
+    let args = Args::parse();
+
+    if let Err(e) = submain(args) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
 }
 
-fn submain() -> Result<(), Error> {
-    let args = Args::parse();
+#[derive(Debug)]
+enum DaemonError {
+    IoError(io::Error),
+    InvalidMessage(serde_json::Error),
+    StateUpdateFailed(StateUpdateError),
+}
+
+impl Display for DaemonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DaemonError::IoError(err) => write!(f, "IO error: {}", err),
+            DaemonError::InvalidMessage(err) => write!(f, "Message decoding error: {}", err),
+            DaemonError::StateUpdateFailed(err) => write!(f, "State update error: {}", err),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ClientError {
+    IoError(io::Error),
+    InvalidMessage(serde_json::Error),
+}
+
+impl From<io::Error> for ClientError {
+    fn from(value: io::Error) -> Self {
+        Self::IoError(value)
+    }
+}
+
+impl From<serde_json::Error> for ClientError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::InvalidMessage(value)
+    }
+}
+
+impl Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientError::IoError(err) => write!(f, "IO error: {}", err),
+            ClientError::InvalidMessage(err) => write!(f, "Message encoding error: {}", err),
+        }
+    }
+}
+
+enum ApplicationError {
+    Daemon(DaemonError),
+    Client(ClientError),
+}
+
+impl Display for ApplicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApplicationError::Daemon(err) => write!(f, "Daemon error: {}", err),
+            ApplicationError::Client(err) => write!(f, "Client error: {}", err),
+        }
+    }
+}
+
+impl From<DaemonError> for ApplicationError {
+    fn from(value: DaemonError) -> Self {
+        Self::Daemon(value)
+    }
+}
+
+impl From<ClientError> for ApplicationError {
+    fn from(value: ClientError) -> Self {
+        Self::Client(value)
+    }
+}
+
+impl From<StateUpdateError> for ApplicationError {
+    fn from(value: StateUpdateError) -> Self {
+        Self::Daemon(DaemonError::StateUpdateFailed(value))
+    }
+}
+
+impl From<io::Error> for DaemonError {
+    fn from(value: io::Error) -> Self {
+        Self::IoError(value)
+    }
+}
+
+impl From<serde_json::Error> for DaemonError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::InvalidMessage(value)
+    }
+}
+
+impl From<StateUpdateError> for DaemonError {
+    fn from(value: StateUpdateError) -> Self {
+        Self::StateUpdateFailed(value)
+    }
+}
+
+impl From<swayipc::Error> for DaemonError {
+    fn from(value: swayipc::Error) -> Self {
+        Self::StateUpdateFailed(StateUpdateError::SwayIPC(value))
+    }
+}
+
+fn run_daemon(socket_path: &PathBuf, initial_state: State) -> Result<(), DaemonError> {
+    let Some(_) = socket_path.parent().map(std::fs::create_dir_all) else {
+        eprintln!("No parent directory found for socket");
+        return Err(DaemonError::IoError(io::Error::new(
+            io::ErrorKind::NotFound,
+            "No parent directory found for socket",
+        )))
+    };
+    if let Err(e) = std::fs::remove_file(socket_path) {
+        eprintln!("Error removing socket: {}", e);
+    }
+
+    let socket = UnixListener::bind(socket_path)?;
+    let mut state = initial_state;
     let mut con = SwayConnection::new()?;
 
+    eprintln!("Listening on {}", socket_path.display());
+    for stream in socket.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                if let Err(err) = handle_socket(&mut con, &mut stream, &mut state) {
+                    eprintln!("Error handling socket: {}", err);
+                }
+            }
+            Err(e) => eprintln!("Error: {}", e),
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_socket(con: &mut SwayConnection, stream: &mut UnixStream, state: &mut State) -> Result<StateUpdate, DaemonError> {
+    let mut buffer = Vec::new();
+    stream.read_to_end(&mut buffer)?;
+
+    let update: StateUpdate = serde_json::from_slice(&buffer)?;
+    eprintln!("Received message: {:?}", update);
+
+    state.update(update.clone());
+    move_window(con, state.clone())?;
+
+    Ok(update)
+}
+
+fn send_message(socket: &PathBuf, state: StateUpdate) -> Result<(), ClientError> {
+    eprintln!("Sending message to {}", socket.display());
+    let mut socket = UnixStream::connect(socket)?;
+
+    let message = serde_json::to_string(&state).expect("message should be serializable");
+    Ok(socket.write_all(message.as_bytes())?)
+}
+
+fn submain(args: Args) -> Result<(), ApplicationError> {
+    let Ok(_) = env::var("WAYLAND_DISPLAY") else {
+        eprintln!("No WAYLAND_DISPLAY environment variable found");
+        return Ok(());
+    };
+    let socket = args.socket.clone();
+
+    if args.daemon {
+        Ok(run_daemon(&socket, State::default().with(args.into()))?)
+    } else {
+        Ok(send_message(&socket, args.into())?)
+    }
+}
+
+fn move_window(con: &mut SwayConnection, state: State) -> Result<(), StateUpdateError> {
     let tree = con.get_tree()?;
+
     let floating_nodes: Vec<_> = tree.iter().filter(|node| node.node_type == NodeType::FloatingCon).collect();
     let target_node = match floating_nodes.len() {
         1 => {
             println!("Only one floating node found, using it.");
             floating_nodes[0]
         },
-        0 => return Err(Error::NoApplicableNode),
-        _ => tree.find_focused_as_ref(|node| node.focused && node.node_type == NodeType::FloatingCon).ok_or(Error::MultipleApplicableNodes)?,
+        0 => return Err(StateUpdateError::NoApplicableNode),
+        _ => tree.find_focused_as_ref(|node| node.focused && node.node_type == NodeType::FloatingCon).ok_or(StateUpdateError::MultipleApplicableNodes)?,
     };
 
-    let working_area = con.find_working_area_for(target_node.id)?.map(Rect::from).ok_or(Error::NoApplicableNode)?;
-    let proper_area = working_area.with_padding(args.padding as i32);
+    let working_area = con.find_working_area_for(target_node.id)?.map(Rect::from).ok_or(StateUpdateError::NoApplicableNode)?;
+    let proper_area = working_area.with_padding(state.padding as i32);
 
     let mut rect: Rect = target_node.rect.into();
     // TODO: do this properly
     rect.height += target_node.deco_rect.height;
 
-    let (width, height) = match (args.width, args.height) {
+    let (width, height) = match (state.width, state.height) {
         (Some(width), Some(height)) => {
             let rect = &rect.scale(width, height, &proper_area);
             (rect.width, rect.height)
@@ -170,11 +418,10 @@ fn submain() -> Result<(), Error> {
     rect.height = height;
     rect.width = width;
 
-    let pos = Position(args.vertical, args.horizontal);
-    let rect = proper_area.get_pos_for_rect_of_size(pos, &rect);
+    let rect = proper_area.get_pos_for_rect_of_size(state.position, &rect);
     // we added a padding to our working area, but the center of the new area is not the same as the
     // center of the old area, so we need to adjust the position of the window
-    let final_pos = rect.translate(args.padding as i32, args.padding as i32);
+    let final_pos = rect.translate(state.padding as i32, state.padding as i32);
 
     con.move_node_to_position(target_node.id, final_pos.x, final_pos.y)?;
 
