@@ -1,7 +1,25 @@
-use std::{env, error::Error, fmt::Display, io::{self, Read, Write}, num::ParseIntError, os::unix::net::{UnixListener, UnixStream}, path::PathBuf, sync::{mpsc::{channel, Sender}, LazyLock}, thread, time::Duration};
+use std::{
+    env,
+    error::Error,
+    fmt::Display,
+    io::{self, Write},
+    num::ParseIntError,
+    os::{
+        fd::AsRawFd,
+        unix::net::{UnixListener, UnixStream},
+    },
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{channel, Sender},
+        Arc, LazyLock,
+    },
+    thread,
+    time::Duration,
+};
 
 use clap::{Parser, ValueEnum};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sway::SwayConnection;
 use swayipc::{Connection, Error as SwayIPCError, NodeType};
 
@@ -99,7 +117,13 @@ impl std::fmt::Display for Unit {
     }
 }
 
-static DEFAULT_SOCKET: LazyLock<String> = LazyLock::new(|| format!("{}/sway-gravity/{}.sock", env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "./".to_string()), env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "sway".to_string())));
+static DEFAULT_SOCKET: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{}/sway-gravity/{}.sock",
+        env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "./".to_string()),
+        env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "sway".to_string())
+    )
+});
 
 /// Automatically position and resize a floating window in Sway.
 ///
@@ -136,19 +160,23 @@ struct Args {
     #[arg(long, value_enum)]
     height: Option<Unit>,
 
-    /// The path to use for the socket to listen on
-    #[arg(short, long, default_value = DEFAULT_SOCKET.as_str())]
-    socket: PathBuf,
-
     /// Run as a daemon, and wait for events via IPC
     #[arg(short, long)]
     daemon: bool,
+
+    /// The path to use for the socket to listen on
+    #[arg(short, long, default_value = DEFAULT_SOCKET.as_str())]
+    socket: PathBuf,
 
     /// Delay (in milliseconds) to wait before processing events from the sway IPC
     ///
     /// This is mainly for allowing sway to settle after a reload or other event.
     #[arg(long, default_value_t = 200)]
     sway_event_delay: u64,
+
+    /// Instruct the running daemon to shutdown
+    #[arg(long)]
+    shutdown: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +218,22 @@ impl State {
         let mut new_state = self.clone();
         new_state.update(update);
         new_state
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum DaemonEvent {
+    Shutdown,
+    Update(StateUpdate),
+}
+
+impl From<Args> for DaemonEvent {
+    fn from(args: Args) -> Self {
+        if args.shutdown {
+            Self::Shutdown
+        } else {
+            Self::Update(StateUpdate::from(args))
+        }
     }
 }
 
@@ -235,7 +279,9 @@ impl std::fmt::Display for StateUpdateError {
         match self {
             StateUpdateError::SwayIPC(err) => write!(f, "SwayIPC error: {}", err),
             StateUpdateError::NoApplicableNode => write!(f, "No applicable node found"),
-            StateUpdateError::MultipleApplicableNodes => write!(f, "Multiple applicable nodes found"),
+            StateUpdateError::MultipleApplicableNodes => {
+                write!(f, "Multiple applicable nodes found")
+            }
         }
     }
 }
@@ -287,6 +333,15 @@ impl Error for DaemonError {
             DaemonError::IoError(err) => Some(err),
             DaemonError::InvalidMessage(err) => Some(err),
             DaemonError::StateUpdateFailed(err) => Some(err),
+        }
+    }
+}
+
+impl From<ClientError> for DaemonError {
+    fn from(value: ClientError) -> Self {
+        match value {
+            ClientError::IoError(err) => Self::IoError(err),
+            ClientError::InvalidMessage(err) => Self::InvalidMessage(err),
         }
     }
 }
@@ -393,117 +448,211 @@ impl From<swayipc::Error> for DaemonError {
     }
 }
 
-impl From<std::sync::mpsc::SendError<StateUpdate>> for DaemonError {
-    fn from(value: std::sync::mpsc::SendError<StateUpdate>) -> Self {
+impl From<std::sync::mpsc::SendError<DaemonEvent>> for DaemonError {
+    fn from(value: std::sync::mpsc::SendError<DaemonEvent>) -> Self {
         Self::IoError(io::Error::new(io::ErrorKind::Other, value))
     }
 }
 
-fn listen_to_socket(socket_path: &PathBuf, tx: Sender<StateUpdate>) -> Result<(), DaemonError> {
+struct IpcSocket {
+    fd: i32,
+    path: PathBuf,
+    thread: thread::JoinHandle<()>,
+}
+
+impl IpcSocket {
+    fn init<T: Send + DeserializeOwned + std::fmt::Debug + 'static>(
+        path: PathBuf,
+        tx: Sender<T>,
+    ) -> Result<Self, io::Error> {
+        let socket = UnixListener::bind(&path)?;
+        let fd = socket.as_raw_fd();
+
+        let thread = thread::spawn(move || {
+            for event in socket.incoming() {
+                match event {
+                    Ok(stream) => {
+                        let msg = serde_json::from_reader(stream)
+                            .expect("message should be serializable");
+                        eprintln!("Received message: {:?}", msg);
+
+                        tx.send(msg).expect("failed to send message");
+                    }
+                    Err(_) => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self { fd, path, thread })
+    }
+
+    fn shutdown(self) -> Result<(), io::Error> {
+        unsafe {
+            libc::shutdown(self.fd, libc::SHUT_RDWR);
+        }
+        self.thread.join().unwrap();
+
+        eprintln!("Socket listener has stopped listening");
+        std::fs::remove_file(self.path)?;
+
+        Ok(())
+    }
+}
+
+fn start_socket(socket_path: &PathBuf, tx: Sender<DaemonEvent>) -> Result<IpcSocket, DaemonError> {
     let Some(_) = socket_path.parent().map(std::fs::create_dir_all) else {
         eprintln!("No parent directory found for socket");
         return Err(DaemonError::IoError(io::Error::new(
             io::ErrorKind::NotFound,
             "No parent directory found for socket",
-        )))
+        )));
     };
-    if let Err(e) = std::fs::remove_file(socket_path) {
-        eprintln!("Failed to remove socket: {}", e);
+
+    match std::fs::exists(socket_path) {
+        Ok(true) => {
+            eprintln!("Socket already exists, shutting down existing daemon...");
+            send_message(socket_path, DaemonEvent::Shutdown)?;
+
+            if let Err(e) = std::fs::remove_file(socket_path) {
+                eprintln!("Failed to remove socket: {}", e);
+            }
+        }
+        _ => eprintln!("Socket does not exist, creating it..."),
     }
 
-    let socket = UnixListener::bind(socket_path)?;
+    let socket = IpcSocket::init(socket_path.clone(), tx)?;
     eprintln!("Listening on {}", socket_path.display());
 
-    for stream in socket.incoming() {
-        match stream {
-            Ok(mut stream) => {
-
-                let mut buffer = Vec::new();
-                stream.read_to_end(&mut buffer)?;
-
-                let update: StateUpdate = serde_json::from_slice(&buffer)?;
-                eprintln!("Received message: {:?}", update);
-
-                tx.send(update)?;
-            }
-            Err(e) => eprintln!("Error: {}", e),
-        }
-    }
-
-    Ok(())
+    Ok(socket)
 }
 
-fn listen_to_sway(tx: Sender<StateUpdate>, delay: u64) -> Result<(), DaemonError> {
-    let subs = [
-        swayipc::EventType::Window,
-        swayipc::EventType::Shutdown,
-        swayipc::EventType::Workspace,
-        swayipc::EventType::Output,
-    ];
-    let stream = Connection::new()?.subscribe(subs)?;
+struct SwaySubscription {
+    thread: thread::JoinHandle<()>,
+    running: Arc<AtomicBool>,
+}
 
-    for event in stream {
-        if event.is_err() {
-            eprintln!("Error: {}", event.unwrap_err());
-            continue;
-        }
+impl SwaySubscription {
+    fn init(con: Connection, tx: Sender<DaemonEvent>, delay: u64) -> Result<Self, io::Error> {
+        let running = Arc::new(AtomicBool::new(true));
+        let r = running.clone();
 
-        // eprintln!("Received event: {:?}", event.as_ref().unwrap().event_type());
-        match event.unwrap() {
-            swayipc::Event::Workspace(event) => {
-                match event.change {
-                    swayipc::WorkspaceChange::Reload => {},
-                    _ => continue,
+        let thread = thread::spawn(move || {
+            let subs = [
+                swayipc::EventType::Window,
+                swayipc::EventType::Shutdown,
+                swayipc::EventType::Workspace,
+                swayipc::EventType::Output,
+                swayipc::EventType::Tick,
+            ];
+
+            let stream = con.subscribe(subs).expect("Failed to subscribe to events");
+            for event in stream {
+                // eprintln!("Received event: {:?}", event.as_ref());
+                if !r.load(Ordering::SeqCst) {
+                    eprintln!("Sway listener is shutting down...");
+                    break;
                 }
-                eprintln!("Received workspace event: {:?}", event);
-            },
-            swayipc::Event::Output(event) => {
-                eprintln!("Received output event: {:?}", event);
-            },
-            swayipc::Event::Shutdown(_) => {
-                eprintln!("Received shutdown event");
-                break;
-            },
-            _ => continue,
-        }
 
-        // HACK: Let sway settle for a moment.
-        // Without this, the bar or other things may end up moving things around and throwing off
-        // the math. I would expect that to trigger a window or workspace event, but it doesn't
-        // appear to do so in my testing environment.
-        thread::sleep(Duration::from_millis(delay));
+                match event {
+                    Ok(event) => {
+                        match event {
+                            swayipc::Event::Workspace(event) => {
+                                match event.change {
+                                    swayipc::WorkspaceChange::Reload => {}
+                                    _ => continue,
+                                }
+                                eprintln!("Received workspace event: {:?}", event);
+                            }
+                            swayipc::Event::Output(event) => {
+                                eprintln!("Received output event: {:?}", event);
+                            }
+                            swayipc::Event::Shutdown(_) => {
+                                eprintln!("Received shutdown event");
+                                break;
+                            }
+                            _ => continue,
+                        }
 
-        let _ = tx.send(StateUpdate::default());
+                        // HACK: Let sway settle for a moment.
+                        // Without this, the bar or other things may end up moving things around and throwing off
+                        // the math. I would expect that to trigger a window or workspace event, but it doesn't
+                        // appear to do so in my testing environment.
+                        thread::sleep(Duration::from_millis(delay));
+
+                        let _ = tx.send(DaemonEvent::Update(StateUpdate::default()));
+                    }
+                    Err(_) => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self { thread, running })
     }
 
-    Ok(())
+    fn shutdown(self) -> Result<(), io::Error> {
+        self.running.store(false, Ordering::SeqCst);
+
+        // ensure the thread has an event to process, which triggers the running check
+        let _ = Connection::new().unwrap().send_tick("");
+        self.thread.join().unwrap();
+
+        Ok(())
+    }
 }
 
-fn run_daemon(socket_path: PathBuf, initial_state: State, sway_delay: u64) -> Result<(), DaemonError> {
+fn run_daemon(
+    socket_path: PathBuf,
+    initial_state: State,
+    sway_delay: u64,
+) -> Result<(), DaemonError> {
     let mut state = initial_state;
     let mut con = SwayConnection::new()?;
 
-    let (tx, rx) = channel::<StateUpdate>();
+    let (tx, rx) = channel::<DaemonEvent>();
     let sway_tx = tx.clone();
+    let ctrlc_tx = tx.clone();
 
-    thread::spawn(move || listen_to_socket(&socket_path, tx));
-    thread::spawn(move || listen_to_sway(sway_tx, sway_delay));
+    let socket = start_socket(&socket_path, tx)?;
+    let sway_sub = SwaySubscription::init(Connection::new()?, sway_tx, sway_delay)?;
+
+    ctrlc::set_handler(move || {
+        ctrlc_tx
+            .send(DaemonEvent::Shutdown)
+            .expect("Failed to send shutdown event");
+    })
+    .expect("Error setting Ctrl-C handler");
 
     for event in rx.iter() {
-        state.update(event);
-        if let Err(e) = move_window(&mut con, state.clone()) {
-            eprintln!("Failed to move window: {}", e);
-        };
+        match event {
+            DaemonEvent::Shutdown => {
+                eprintln!("Shutting down daemon...");
+                break;
+            }
+            DaemonEvent::Update(update) => {
+                state.update(update);
+
+                if let Err(e) = move_window(&mut con, state.clone()) {
+                    eprintln!("Failed to move window: {}", e);
+                };
+            }
+        }
     }
+
+    socket.shutdown()?;
+    sway_sub.shutdown()?;
 
     Ok(())
 }
 
-fn send_message(socket: &PathBuf, state: StateUpdate) -> Result<(), ClientError> {
+fn send_message(socket: &PathBuf, event: DaemonEvent) -> Result<(), ClientError> {
     eprintln!("Sending message to {}", socket.display());
     let mut socket = UnixStream::connect(socket)?;
 
-    let message = serde_json::to_string(&state).expect("message should be serializable");
+    let message = serde_json::to_string(&event).expect("message should be serializable");
     Ok(socket.write_all(message.as_bytes())?)
 }
 
@@ -516,7 +665,11 @@ fn submain(args: Args) -> Result<(), ApplicationError> {
     let sway_delay = args.sway_event_delay;
 
     if args.daemon {
-        Ok(run_daemon(socket, State::default().with(args.into()), sway_delay)?)
+        Ok(run_daemon(
+            socket,
+            State::default().with(args.into()),
+            sway_delay,
+        )?)
     } else {
         Ok(send_message(&socket, args.into())?)
     }
@@ -525,17 +678,25 @@ fn submain(args: Args) -> Result<(), ApplicationError> {
 fn move_window(con: &mut SwayConnection, state: State) -> Result<(), StateUpdateError> {
     let tree = con.get_tree()?;
 
-    let floating_nodes: Vec<_> = tree.iter().filter(|node| node.node_type == NodeType::FloatingCon).collect();
+    let floating_nodes: Vec<_> = tree
+        .iter()
+        .filter(|node| node.node_type == NodeType::FloatingCon)
+        .collect();
     let target_node = match floating_nodes.len() {
         1 => {
             println!("Only one floating node found, using it.");
             floating_nodes[0]
-        },
+        }
         0 => return Err(StateUpdateError::NoApplicableNode),
-        _ => tree.find_focused_as_ref(|node| node.focused && node.node_type == NodeType::FloatingCon).ok_or(StateUpdateError::MultipleApplicableNodes)?,
+        _ => tree
+            .find_focused_as_ref(|node| node.focused && node.node_type == NodeType::FloatingCon)
+            .ok_or(StateUpdateError::MultipleApplicableNodes)?,
     };
 
-    let working_area = con.find_working_area_for(target_node.id)?.map(Rect::from).ok_or(StateUpdateError::NoApplicableNode)?;
+    let working_area = con
+        .find_working_area_for(target_node.id)?
+        .map(Rect::from)
+        .ok_or(StateUpdateError::NoApplicableNode)?;
     let proper_area = working_area.with_padding(state.padding as i32);
 
     let mut rect: Rect = target_node.rect.into();
@@ -546,18 +707,22 @@ fn move_window(con: &mut SwayConnection, state: State) -> Result<(), StateUpdate
         (Some(width), Some(height)) => {
             let rect = &rect.scale(width, height, &proper_area);
             (rect.width, rect.height)
-        },
+        }
         (Some(width), None) => {
             let rect = &rect.scale_to_match_width(width, &proper_area);
             (rect.width, rect.height)
-        },
+        }
         (None, Some(height)) => {
             let rect = &rect.scale_to_match_height(height, &proper_area);
             (rect.width, rect.height)
-        },
+        }
         _ => (target_node.rect.width, target_node.rect.height),
     };
-    con.resize_node(target_node.id, Unit::Pixels(width as u32), Unit::Pixels(height as u32))?;
+    con.resize_node(
+        target_node.id,
+        Unit::Pixels(width as u32),
+        Unit::Pixels(height as u32),
+    )?;
 
     rect.height = height;
     rect.width = width;
@@ -580,10 +745,14 @@ struct Rect {
     height: i32,
 }
 
-
 impl Rect {
     fn _new(x: i32, y: i32, width: i32, height: i32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     fn with_padding(&self, padding: i32) -> Self {
