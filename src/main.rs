@@ -1,25 +1,31 @@
-use std::{env, fmt::Display, io::{self, Read, Write}, num::ParseIntError, os::unix::net::{UnixListener, UnixStream}, path::PathBuf, sync::LazyLock};
+use std::{env, error::Error, fmt::Display, io::{self, Read, Write}, num::ParseIntError, os::unix::net::{UnixListener, UnixStream}, path::PathBuf, sync::{mpsc::{channel, Sender}, LazyLock}, thread, time::Duration};
 
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use sway::SwayConnection;
-use swayipc::{Error as SwayIPCError, NodeType};
+use swayipc::{Connection, Error as SwayIPCError, NodeType};
 
 mod sway;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 enum Vertical {
+    /// Top-aligned in the top third of the space
     Top,
+    /// Centered on the middle third of the space
     Middle,
+    /// Bottom-aligned in the bottom third of the space
     Bottom,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 enum Horizontal {
+    /// Left-aligned in the left third of the space
     Left,
+    /// Centered on the middle third of the space
     Middle,
+    /// Right-aligned in the right third of the space
     Right,
 }
 
@@ -28,7 +34,9 @@ struct Position(Vertical, Horizontal);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Unit {
+    /// A dimension in pixels (ex: `100` or `100px`)
     Pixels(u32),
+    /// A dimension as a percentage (ex: `33.333%`)
     Percentage(f32),
 }
 
@@ -38,11 +46,20 @@ enum ParseUnitError {
     ParseFloatError(std::num::ParseFloatError),
 }
 
-impl From<ParseUnitError> for Box<dyn std::error::Error + Send + Sync> {
-    fn from(err: ParseUnitError) -> Self {
-        match err {
-            ParseUnitError::ParseIntError(err) => Box::new(err),
-            ParseUnitError::ParseFloatError(err) => Box::new(err),
+impl Display for ParseUnitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseUnitError::ParseIntError(err) => write!(f, "ParseIntError: {}", err),
+            ParseUnitError::ParseFloatError(err) => write!(f, "ParseFloatError: {}", err),
+        }
+    }
+}
+
+impl Error for ParseUnitError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ParseUnitError::ParseIntError(err) => Some(err),
+            ParseUnitError::ParseFloatError(err) => Some(err),
         }
     }
 }
@@ -84,28 +101,54 @@ impl std::fmt::Display for Unit {
 
 static DEFAULT_SOCKET: LazyLock<String> = LazyLock::new(|| format!("{}/sway-gravity/{}.sock", env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "./".to_string()), env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "sway".to_string())));
 
-/// Move a floating window to the specified position
+/// Automatically position and resize a floating window in Sway.
+///
+/// When run as a daemon, this will listen for events from Sway and a standalone socket, and
+/// automatically position and resize windows in reaction to those events. While running, the
+/// daemon will preserve the most recent calculated state, and automatically update the window
+/// whenever necessary.
+///
+/// When run as a client, this will send a message to the daemon to position and resize the window
+/// Events do not need included every possible property allowed, only the ones that need to be
+/// changed.
+///
+/// `width` and `height` can both be provided as a percentage of the available area, or as a pixel
+/// value. When both `width` and `height` is provided, the window will be resized to exactly that
+/// size. When only one dimension is provided, the other will be automatically calculated to
+/// maintain the aspect ratio of the window.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
+    /// The vertical third of the screen to place the window in
     vertical: Vertical,
+    /// The horizontal third of the screen to place the window in
     horizontal: Horizontal,
 
+    /// The amount of padding to add around moved window
     #[arg(short, long)]
     padding: Option<u32>,
 
-    #[arg(long)]
+    /// Resize the window to this width
+    #[arg(long, value_enum)]
     width: Option<Unit>,
 
-    #[arg(long)]
+    /// Resize the window to this height
+    #[arg(long, value_enum)]
     height: Option<Unit>,
 
+    /// The path to use for the socket to listen on
     #[arg(short, long, default_value = DEFAULT_SOCKET.as_str())]
     socket: PathBuf,
 
     /// Run as a daemon, and wait for events via IPC
     #[arg(short, long)]
     daemon: bool,
+
+    /// Delay (in milliseconds) to wait before processing events from the sway IPC
+    ///
+    /// This is mainly for allowing sway to settle after a reload or other event.
+    #[arg(long, default_value_t = 200)]
+    sway_event_delay: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +240,15 @@ impl std::fmt::Display for StateUpdateError {
     }
 }
 
+impl Error for StateUpdateError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            StateUpdateError::SwayIPC(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
 impl From<SwayIPCError> for StateUpdateError {
     fn from(err: SwayIPCError) -> Self {
         Self::SwayIPC(err)
@@ -229,10 +281,38 @@ impl Display for DaemonError {
     }
 }
 
+impl Error for DaemonError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            DaemonError::IoError(err) => Some(err),
+            DaemonError::InvalidMessage(err) => Some(err),
+            DaemonError::StateUpdateFailed(err) => Some(err),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum ClientError {
     IoError(io::Error),
     InvalidMessage(serde_json::Error),
+}
+
+impl Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientError::IoError(err) => write!(f, "IO error: {}", err),
+            ClientError::InvalidMessage(err) => write!(f, "Message encoding error: {}", err),
+        }
+    }
+}
+
+impl Error for ClientError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ClientError::IoError(err) => Some(err),
+            ClientError::InvalidMessage(err) => Some(err),
+        }
+    }
 }
 
 impl From<io::Error> for ClientError {
@@ -247,15 +327,7 @@ impl From<serde_json::Error> for ClientError {
     }
 }
 
-impl Display for ClientError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ClientError::IoError(err) => write!(f, "IO error: {}", err),
-            ClientError::InvalidMessage(err) => write!(f, "Message encoding error: {}", err),
-        }
-    }
-}
-
+#[derive(Debug)]
 enum ApplicationError {
     Daemon(DaemonError),
     Client(ClientError),
@@ -266,6 +338,15 @@ impl Display for ApplicationError {
         match self {
             ApplicationError::Daemon(err) => write!(f, "Daemon error: {}", err),
             ApplicationError::Client(err) => write!(f, "Client error: {}", err),
+        }
+    }
+}
+
+impl Error for ApplicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ApplicationError::Daemon(err) => Some(err),
+            ApplicationError::Client(err) => Some(err),
         }
     }
 }
@@ -312,7 +393,13 @@ impl From<swayipc::Error> for DaemonError {
     }
 }
 
-fn run_daemon(socket_path: &PathBuf, initial_state: State) -> Result<(), DaemonError> {
+impl From<std::sync::mpsc::SendError<StateUpdate>> for DaemonError {
+    fn from(value: std::sync::mpsc::SendError<StateUpdate>) -> Self {
+        Self::IoError(io::Error::new(io::ErrorKind::Other, value))
+    }
+}
+
+fn listen_to_socket(socket_path: &PathBuf, tx: Sender<StateUpdate>) -> Result<(), DaemonError> {
     let Some(_) = socket_path.parent().map(std::fs::create_dir_all) else {
         eprintln!("No parent directory found for socket");
         return Err(DaemonError::IoError(io::Error::new(
@@ -321,20 +408,23 @@ fn run_daemon(socket_path: &PathBuf, initial_state: State) -> Result<(), DaemonE
         )))
     };
     if let Err(e) = std::fs::remove_file(socket_path) {
-        eprintln!("Error removing socket: {}", e);
+        eprintln!("Failed to remove socket: {}", e);
     }
 
     let socket = UnixListener::bind(socket_path)?;
-    let mut state = initial_state;
-    let mut con = SwayConnection::new()?;
-
     eprintln!("Listening on {}", socket_path.display());
+
     for stream in socket.incoming() {
         match stream {
             Ok(mut stream) => {
-                if let Err(err) = handle_socket(&mut con, &mut stream, &mut state) {
-                    eprintln!("Error handling socket: {}", err);
-                }
+
+                let mut buffer = Vec::new();
+                stream.read_to_end(&mut buffer)?;
+
+                let update: StateUpdate = serde_json::from_slice(&buffer)?;
+                eprintln!("Received message: {:?}", update);
+
+                tx.send(update)?;
             }
             Err(e) => eprintln!("Error: {}", e),
         }
@@ -343,17 +433,70 @@ fn run_daemon(socket_path: &PathBuf, initial_state: State) -> Result<(), DaemonE
     Ok(())
 }
 
-fn handle_socket(con: &mut SwayConnection, stream: &mut UnixStream, state: &mut State) -> Result<StateUpdate, DaemonError> {
-    let mut buffer = Vec::new();
-    stream.read_to_end(&mut buffer)?;
+fn listen_to_sway(tx: Sender<StateUpdate>, delay: u64) -> Result<(), DaemonError> {
+    let subs = [
+        swayipc::EventType::Window,
+        swayipc::EventType::Shutdown,
+        swayipc::EventType::Workspace,
+        swayipc::EventType::Output,
+    ];
+    let stream = Connection::new()?.subscribe(subs)?;
 
-    let update: StateUpdate = serde_json::from_slice(&buffer)?;
-    eprintln!("Received message: {:?}", update);
+    for event in stream {
+        if event.is_err() {
+            eprintln!("Error: {}", event.unwrap_err());
+            continue;
+        }
 
-    state.update(update.clone());
-    move_window(con, state.clone())?;
+        // eprintln!("Received event: {:?}", event.as_ref().unwrap().event_type());
+        match event.unwrap() {
+            swayipc::Event::Workspace(event) => {
+                match event.change {
+                    swayipc::WorkspaceChange::Reload => {},
+                    _ => continue,
+                }
+                eprintln!("Received workspace event: {:?}", event);
+            },
+            swayipc::Event::Output(event) => {
+                eprintln!("Received output event: {:?}", event);
+            },
+            swayipc::Event::Shutdown(_) => {
+                eprintln!("Received shutdown event");
+                break;
+            },
+            _ => continue,
+        }
 
-    Ok(update)
+        // HACK: Let sway settle for a moment.
+        // Without this, the bar or other things may end up moving things around and throwing off
+        // the math. I would expect that to trigger a window or workspace event, but it doesn't
+        // appear to do so in my testing environment.
+        thread::sleep(Duration::from_millis(delay));
+
+        let _ = tx.send(StateUpdate::default());
+    }
+
+    Ok(())
+}
+
+fn run_daemon(socket_path: PathBuf, initial_state: State, sway_delay: u64) -> Result<(), DaemonError> {
+    let mut state = initial_state;
+    let mut con = SwayConnection::new()?;
+
+    let (tx, rx) = channel::<StateUpdate>();
+    let sway_tx = tx.clone();
+
+    thread::spawn(move || listen_to_socket(&socket_path, tx));
+    thread::spawn(move || listen_to_sway(sway_tx, sway_delay));
+
+    for event in rx.iter() {
+        state.update(event);
+        if let Err(e) = move_window(&mut con, state.clone()) {
+            eprintln!("Failed to move window: {}", e);
+        };
+    }
+
+    Ok(())
 }
 
 fn send_message(socket: &PathBuf, state: StateUpdate) -> Result<(), ClientError> {
@@ -370,9 +513,10 @@ fn submain(args: Args) -> Result<(), ApplicationError> {
         return Ok(());
     };
     let socket = args.socket.clone();
+    let sway_delay = args.sway_event_delay;
 
     if args.daemon {
-        Ok(run_daemon(&socket, State::default().with(args.into()))?)
+        Ok(run_daemon(socket, State::default().with(args.into()), sway_delay)?)
     } else {
         Ok(send_message(&socket, args.into())?)
     }
