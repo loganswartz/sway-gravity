@@ -457,18 +457,18 @@ impl From<std::sync::mpsc::SendError<DaemonEvent>> for DaemonError {
 struct IpcSocket {
     fd: i32,
     path: PathBuf,
-    thread: thread::JoinHandle<()>,
+    _thread: thread::JoinHandle<()>,
 }
 
 impl IpcSocket {
-    fn init<T: Send + DeserializeOwned + std::fmt::Debug + 'static>(
+    fn init<T: DeserializeOwned + Send + std::fmt::Debug + 'static>(
         path: PathBuf,
         tx: Sender<T>,
     ) -> Result<Self, io::Error> {
         let socket = UnixListener::bind(&path)?;
         let fd = socket.as_raw_fd();
 
-        let thread = thread::spawn(move || {
+        let _thread = thread::spawn(move || {
             for event in socket.incoming() {
                 match event {
                     Ok(stream) => {
@@ -483,62 +483,80 @@ impl IpcSocket {
                     }
                 }
             }
+
+            eprintln!("Socket listener was closed.");
         });
 
-        Ok(Self { fd, path, thread })
+        Ok(Self { fd, path, _thread })
     }
 
-    fn shutdown(self) -> Result<(), io::Error> {
+    fn init_or_replace(
+        socket_path: &PathBuf,
+        tx: Sender<DaemonEvent>,
+    ) -> Result<Self, DaemonError> {
+        match std::fs::exists(socket_path) {
+            Ok(true) => {
+                eprintln!("Socket already exists, shutting down existing daemon...");
+                send_message(socket_path, DaemonEvent::Shutdown)?;
+
+                while let Ok(true) = std::fs::exists(socket_path) {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+            _ => eprintln!("Socket does not exist, creating it..."),
+        }
+
+        let Some(_) = socket_path.parent().map(std::fs::create_dir_all) else {
+            eprintln!("No parent directory found for socket");
+            return Err(DaemonError::IoError(io::Error::new(
+                io::ErrorKind::NotFound,
+                "No parent directory found for socket",
+            )));
+        };
+
+        let socket = Self::init(socket_path.clone(), tx)?;
+        eprintln!("Listening on {}", socket_path.display());
+
+        Ok(socket)
+    }
+
+    fn shutdown(self) {}
+}
+
+impl Drop for IpcSocket {
+    fn drop(&mut self) {
         unsafe {
             libc::shutdown(self.fd, libc::SHUT_RDWR);
         }
-        self.thread.join().unwrap();
 
-        eprintln!("Socket listener has stopped listening");
-        std::fs::remove_file(self.path)?;
-
-        Ok(())
+        let _ = std::fs::remove_file(&self.path);
     }
-}
-
-fn start_socket(socket_path: &PathBuf, tx: Sender<DaemonEvent>) -> Result<IpcSocket, DaemonError> {
-    let Some(_) = socket_path.parent().map(std::fs::create_dir_all) else {
-        eprintln!("No parent directory found for socket");
-        return Err(DaemonError::IoError(io::Error::new(
-            io::ErrorKind::NotFound,
-            "No parent directory found for socket",
-        )));
-    };
-
-    match std::fs::exists(socket_path) {
-        Ok(true) => {
-            eprintln!("Socket already exists, shutting down existing daemon...");
-            send_message(socket_path, DaemonEvent::Shutdown)?;
-
-            if let Err(e) = std::fs::remove_file(socket_path) {
-                eprintln!("Failed to remove socket: {}", e);
-            }
-        }
-        _ => eprintln!("Socket does not exist, creating it..."),
-    }
-
-    let socket = IpcSocket::init(socket_path.clone(), tx)?;
-    eprintln!("Listening on {}", socket_path.display());
-
-    Ok(socket)
 }
 
 struct SwaySubscription {
-    thread: thread::JoinHandle<()>,
+    con: Connection,
     running: Arc<AtomicBool>,
+    _thread: thread::JoinHandle<()>,
 }
 
 impl SwaySubscription {
-    fn init(con: Connection, tx: Sender<DaemonEvent>, delay: u64) -> Result<Self, io::Error> {
+    fn init<T: std::convert::From<swayipc::Event> + Send + std::fmt::Debug + 'static>(
+        con_factory: fn() -> Result<Connection, SwayIPCError>,
+        tx: Sender<T>,
+        delay: u64,
+    ) -> Result<Self, io::Error> {
         let running = Arc::new(AtomicBool::new(true));
         let r = running.clone();
+        let sub_con = con_factory().map_err(|e| {
+            eprintln!("Failed to create sway connection: {}", e);
+            io::Error::new(io::ErrorKind::Other, e)
+        })?;
+        let tick_con = con_factory().map_err(|e| {
+            eprintln!("Failed to create sway connection: {}", e);
+            io::Error::new(io::ErrorKind::Other, e)
+        })?;
 
-        let thread = thread::spawn(move || {
+        let _thread = thread::spawn(move || {
             let subs = [
                 swayipc::EventType::Window,
                 swayipc::EventType::Shutdown,
@@ -547,7 +565,9 @@ impl SwaySubscription {
                 swayipc::EventType::Tick,
             ];
 
-            let stream = con.subscribe(subs).expect("Failed to subscribe to events");
+            let stream = sub_con
+                .subscribe(subs)
+                .expect("Failed to subscribe to events");
             for event in stream {
                 // eprintln!("Received event: {:?}", event.as_ref());
                 if !r.load(Ordering::SeqCst) {
@@ -557,21 +577,11 @@ impl SwaySubscription {
 
                 match event {
                     Ok(event) => {
-                        match event {
-                            swayipc::Event::Workspace(event) => {
-                                match event.change {
-                                    swayipc::WorkspaceChange::Reload => {}
-                                    _ => continue,
-                                }
-                                eprintln!("Received workspace event: {:?}", event);
-                            }
-                            swayipc::Event::Output(event) => {
-                                eprintln!("Received output event: {:?}", event);
-                            }
-                            swayipc::Event::Shutdown(_) => {
-                                eprintln!("Received shutdown event");
-                                break;
-                            }
+                        match &event {
+                            swayipc::Event::Workspace(event) => match event.change {
+                                swayipc::WorkspaceChange::Reload => {}
+                                _ => continue,
+                            },
                             _ => continue,
                         }
 
@@ -581,26 +591,39 @@ impl SwaySubscription {
                         // appear to do so in my testing environment.
                         thread::sleep(Duration::from_millis(delay));
 
-                        let _ = tx.send(DaemonEvent::Update(StateUpdate::default()));
+                        let _ = tx.send(event.into());
                     }
                     Err(_) => {
                         break;
                     }
                 }
             }
+
+            eprintln!("Sway subscription was closed.");
         });
 
-        Ok(Self { thread, running })
+        Ok(Self {
+            con: tick_con,
+            running,
+            _thread,
+        })
     }
 
-    fn shutdown(self) -> Result<(), io::Error> {
+    fn shutdown(self) {}
+}
+
+impl Drop for SwaySubscription {
+    fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
 
         // ensure the thread has an event to process, which triggers the running check
-        let _ = Connection::new().unwrap().send_tick("");
-        self.thread.join().unwrap();
+        let _ = self.con.send_tick("");
+    }
+}
 
-        Ok(())
+impl From<swayipc::Event> for DaemonEvent {
+    fn from(_: swayipc::Event) -> Self {
+        DaemonEvent::Update(StateUpdate::default())
     }
 }
 
@@ -616,8 +639,8 @@ fn run_daemon(
     let sway_tx = tx.clone();
     let ctrlc_tx = tx.clone();
 
-    let socket = start_socket(&socket_path, tx)?;
-    let sway_sub = SwaySubscription::init(Connection::new()?, sway_tx, sway_delay)?;
+    let socket = IpcSocket::init_or_replace(&socket_path, tx)?;
+    let sway_sub = SwaySubscription::init(Connection::new, sway_tx, sway_delay)?;
 
     ctrlc::set_handler(move || {
         ctrlc_tx
@@ -629,7 +652,7 @@ fn run_daemon(
     for event in rx.iter() {
         match event {
             DaemonEvent::Shutdown => {
-                eprintln!("Shutting down daemon...");
+                eprintln!("Shutdown requested.");
                 break;
             }
             DaemonEvent::Update(update) => {
@@ -642,8 +665,8 @@ fn run_daemon(
         }
     }
 
-    socket.shutdown()?;
-    sway_sub.shutdown()?;
+    socket.shutdown();
+    sway_sub.shutdown();
 
     Ok(())
 }
