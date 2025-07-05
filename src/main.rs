@@ -47,14 +47,56 @@ enum Horizontal {
     Right,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Default for Vertical {
+    fn default() -> Self {
+        Self::Bottom
+    }
+}
+
+impl Default for Horizontal {
+    fn default() -> Self {
+        Self::Right
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Position(Vertical, Horizontal);
+
+impl Position {
+    fn update(&mut self, update: PositionUpdate) {
+        if let Some(vertical) = update.0 {
+            self.0 = vertical;
+        }
+        if let Some(horizontal) = update.1 {
+            self.1 = horizontal;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PositionUpdate(Option<Vertical>, Option<Horizontal>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Unit {
+    /// A relative dimension, which can be a percentage or a pixel value (ex: `+100px` or `-5%`)
+    Relative(RelativeUnit),
+    /// An absolute dimension, which can be a percentage or a pixel value (ex: `100px` or `33.333%`)
+    Absolute(AbsoluteUnit),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum AbsoluteUnit {
     /// A dimension in pixels (ex: `100` or `100px`)
     Pixels(u32),
     /// A dimension as a percentage (ex: `33.333%`)
+    Percentage(f32),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum RelativeUnit {
+    /// A relative dimension in pixels (ex: `+100` or `-100px`)
+    Pixels(i32),
+    /// A dimension as a percentage (ex: `-5%`)
     Percentage(f32),
 }
 
@@ -98,17 +140,61 @@ impl std::str::FromStr for Unit {
     type Err = ParseUnitError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Some(value) = s.strip_suffix("%") {
-            Ok(Self::Percentage(value.parse()?))
+        if s.starts_with(['-', '+']) {
+            Ok(Self::Relative(s.parse()?))
         } else {
-            // Default to pixels if no suffix is provided
-            let _ = s.strip_suffix("px");
-            Ok(Self::Pixels(s.parse()?))
+            Ok(Self::Absolute(s.parse()?))
         }
     }
 }
 
 impl std::fmt::Display for Unit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Relative(value) => write!(f, "{}", value),
+            Self::Absolute(value) => write!(f, "{}", value),
+        }
+    }
+}
+
+impl std::str::FromStr for RelativeUnit {
+    type Err = ParseUnitError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(value) = s.strip_suffix("%") {
+            Ok(Self::Percentage(value.parse()?))
+        } else {
+            // Default to pixels if no suffix is provided
+            let value = s.strip_suffix("px").unwrap_or(s);
+            Ok(Self::Pixels(value.parse()?))
+        }
+    }
+}
+
+impl std::fmt::Display for RelativeUnit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pixels(value) => write!(f, "{} px", value),
+            Self::Percentage(value) => write!(f, "{} ppt", value),
+        }
+    }
+}
+
+impl std::str::FromStr for AbsoluteUnit {
+    type Err = ParseUnitError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(value) = s.strip_suffix("%") {
+            Ok(Self::Percentage(value.parse()?))
+        } else {
+            // Default to pixels if no suffix is provided
+            let value = s.strip_suffix("px").unwrap_or(s);
+            Ok(Self::Pixels(value.parse()?))
+        }
+    }
+}
+
+impl std::fmt::Display for AbsoluteUnit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Pixels(value) => write!(f, "{} px", value),
@@ -144,20 +230,20 @@ static DEFAULT_SOCKET: LazyLock<String> = LazyLock::new(|| {
 #[command(version, about)]
 struct Args {
     /// The vertical third of the screen to place the window in
-    vertical: Vertical,
+    vertical: Option<Vertical>,
     /// The horizontal third of the screen to place the window in
-    horizontal: Horizontal,
+    horizontal: Option<Horizontal>,
 
     /// The amount of padding to add around moved window
     #[arg(short, long)]
     padding: Option<u32>,
 
     /// Resize the window to this width
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, allow_hyphen_values = true)]
     width: Option<Unit>,
 
     /// Resize the window to this height
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, allow_hyphen_values = true)]
     height: Option<Unit>,
 
     /// Run as a daemon, and wait for events via IPC
@@ -179,7 +265,7 @@ struct Args {
     shutdown: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 struct State {
     position: Position,
     padding: u32,
@@ -187,22 +273,9 @@ struct State {
     height: Option<Unit>,
 }
 
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            position: Position(Vertical::Bottom, Horizontal::Right),
-            padding: 0,
-            width: None,
-            height: None,
-        }
-    }
-}
-
 impl State {
     fn update(&mut self, update: StateUpdate) {
-        if let Some(position) = update.position {
-            self.position = position;
-        }
+        self.position.update(update.position);
         if let Some(padding) = update.padding {
             self.padding = padding;
         }
@@ -239,7 +312,7 @@ impl From<Args> for DaemonEvent {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct StateUpdate {
-    position: Option<Position>,
+    position: PositionUpdate,
     padding: Option<u32>,
     width: Option<Option<Unit>>,
     height: Option<Option<Unit>>,
@@ -248,7 +321,7 @@ struct StateUpdate {
 impl From<Args> for StateUpdate {
     fn from(args: Args) -> Self {
         Self {
-            position: Some(Position(args.vertical, args.horizontal)),
+            position: PositionUpdate(args.vertical, args.horizontal),
             padding: args.padding,
             width: Some(args.width),
             height: Some(args.height),
@@ -256,10 +329,16 @@ impl From<Args> for StateUpdate {
     }
 }
 
+impl From<Position> for PositionUpdate {
+    fn from(state: Position) -> Self {
+        Self(Some(state.0), Some(state.1))
+    }
+}
+
 impl From<State> for StateUpdate {
     fn from(state: State) -> Self {
         Self {
-            position: Some(state.position),
+            position: state.position.into(),
             padding: Some(state.padding),
             width: Some(state.width),
             height: Some(state.height),
@@ -722,29 +801,30 @@ fn move_window(con: &mut SwayConnection, state: State) -> Result<(), StateUpdate
         .ok_or(StateUpdateError::NoApplicableNode)?;
     let proper_area = working_area.with_padding(state.padding as i32);
 
+    let original_rect: Rect = target_node.rect.into();
     let mut rect: Rect = target_node.rect.into();
     // TODO: do this properly
     rect.height += target_node.deco_rect.height;
 
     let (width, height) = match (state.width, state.height) {
         (Some(width), Some(height)) => {
-            let rect = &rect.scale(width, height, &proper_area);
+            let rect = &rect.scale(width, height, &original_rect, &proper_area);
             (rect.width, rect.height)
         }
         (Some(width), None) => {
-            let rect = &rect.scale_to_match_width(width, &proper_area);
+            let rect = &rect.scale_to_match_width(width, &original_rect, &proper_area);
             (rect.width, rect.height)
         }
         (None, Some(height)) => {
-            let rect = &rect.scale_to_match_height(height, &proper_area);
+            let rect = &rect.scale_to_match_height(height, &original_rect, &proper_area);
             (rect.width, rect.height)
         }
         _ => (target_node.rect.width, target_node.rect.height),
     };
     con.resize_node(
         target_node.id,
-        Unit::Pixels(width as u32),
-        Unit::Pixels(height as u32),
+        Unit::Absolute(AbsoluteUnit::Pixels(width as u32)),
+        Unit::Absolute(AbsoluteUnit::Pixels(height as u32)),
     )?;
 
     rect.height = height;
@@ -796,17 +876,37 @@ impl Rect {
         rect
     }
 
-    fn scale(&self, width: Unit, height: Unit, container: &Rect) -> Self {
+    fn scale(&self, width: Unit, height: Unit, target: &Rect, container: &Rect) -> Self {
         let mut rect = *self;
 
         let width = match width {
-            Unit::Percentage(width) => (container.width as f32 * (width / 100.0)).round() as u32,
-            Unit::Pixels(width) => width,
+            Unit::Absolute(absolute) => match absolute {
+                AbsoluteUnit::Percentage(width) => {
+                    (container.width as f32 * (width / 100.0)).round() as u32
+                }
+                AbsoluteUnit::Pixels(width) => width,
+            },
+            Unit::Relative(relative) => match relative {
+                RelativeUnit::Percentage(width) => (container.width as f32
+                    * ((target.width as f32 / container.width as f32) + (width / 100.0)))
+                    .round() as u32,
+                RelativeUnit::Pixels(width) => target.width.saturating_add(width) as u32,
+            },
         };
 
         let height = match height {
-            Unit::Percentage(height) => (container.height as f32 * (height / 100.0)).round() as u32,
-            Unit::Pixels(height) => height,
+            Unit::Absolute(absolute) => match absolute {
+                AbsoluteUnit::Percentage(height) => {
+                    (container.height as f32 * (height / 100.0)).round() as u32
+                }
+                AbsoluteUnit::Pixels(height) => height,
+            },
+            Unit::Relative(relative) => match relative {
+                RelativeUnit::Percentage(height) => (target.height as f32
+                    * ((target.height as f32 / container.height as f32) + (height / 100.0)))
+                    .round() as u32,
+                RelativeUnit::Pixels(height) => target.height.saturating_add(height) as u32,
+            },
         };
 
         rect.width = width as i32;
@@ -815,12 +915,22 @@ impl Rect {
         rect
     }
 
-    fn scale_to_match_height(&self, height: Unit, container: &Rect) -> Self {
+    fn scale_to_match_height(&self, height: Unit, target: &Rect, container: &Rect) -> Self {
         let mut rect = *self;
 
         let height = match height {
-            Unit::Percentage(height) => (container.height as f32 * (height / 100.0)).round() as u32,
-            Unit::Pixels(height) => height,
+            Unit::Absolute(absolute) => match absolute {
+                AbsoluteUnit::Percentage(height) => {
+                    (container.height as f32 * (height / 100.0)).round() as u32
+                }
+                AbsoluteUnit::Pixels(height) => height,
+            },
+            Unit::Relative(relative) => match relative {
+                RelativeUnit::Percentage(height) => (target.height as f32
+                    * ((target.height as f32 / container.height as f32) + (height / 100.0)))
+                    .round() as u32,
+                RelativeUnit::Pixels(height) => target.height.saturating_add(height) as u32,
+            },
         };
 
         let ratio = rect.width as f32 / rect.height as f32;
@@ -830,12 +940,22 @@ impl Rect {
         rect
     }
 
-    fn scale_to_match_width(&self, width: Unit, container: &Rect) -> Self {
+    fn scale_to_match_width(&self, width: Unit, target: &Rect, container: &Rect) -> Self {
         let mut rect = *self;
 
         let width = match width {
-            Unit::Percentage(width) => (container.width as f32 * (width / 100.0)).round() as u32,
-            Unit::Pixels(width) => width,
+            Unit::Absolute(absolute) => match absolute {
+                AbsoluteUnit::Percentage(width) => {
+                    (container.width as f32 * (width / 100.0)).round() as u32
+                }
+                AbsoluteUnit::Pixels(width) => width,
+            },
+            Unit::Relative(relative) => match relative {
+                RelativeUnit::Percentage(width) => (target.width as f32
+                    * ((target.width as f32 / container.width as f32) + (width / 100.0)))
+                    .round() as u32,
+                RelativeUnit::Pixels(width) => target.width.saturating_add(width) as u32,
+            },
         };
 
         let ratio = rect.height as f32 / rect.width as f32;
@@ -928,53 +1048,184 @@ mod tests {
     }
 
     #[test]
-    fn test_scale_to_match_height() {
+    fn test_scale_to_match_height_absolute_pixels() {
         let container = Rect::_new(0, 0, 200, 100);
         let rect = Rect::_new(0, 0, 200, 100);
-        let rect = rect.scale_to_match_height(Unit::Pixels(50), &container);
+        let rect =
+            rect.scale_to_match_height(Unit::Absolute(AbsoluteUnit::Pixels(50)), &rect, &container);
 
         assert_eq!(rect.width, 100);
         assert_eq!(rect.height, 50);
 
         let container = Rect::_new(0, 0, 100, 50);
         let rect = Rect::_new(0, 0, 100, 50);
-        let rect = rect.scale_to_match_height(Unit::Pixels(200), &container);
+        let rect = rect.scale_to_match_height(
+            Unit::Absolute(AbsoluteUnit::Pixels(200)),
+            &rect,
+            &container,
+        );
 
         assert_eq!(rect.width, 400);
         assert_eq!(rect.height, 200);
     }
 
     #[test]
-    fn test_scale_to_match_width() {
+    fn test_scale_to_match_height_absolute_percentage() {
         let container = Rect::_new(0, 0, 200, 100);
         let rect = Rect::_new(0, 0, 200, 100);
-        let rect = rect.scale_to_match_width(Unit::Pixels(400), &container);
-
-        assert_eq!(rect.width, 400);
-        assert_eq!(rect.height, 200);
-
-        let container = Rect::_new(0, 0, 100, 50);
-        let rect = Rect::_new(0, 0, 100, 50);
-        let rect = rect.scale_to_match_width(Unit::Pixels(25), &container);
-
-        assert_eq!(rect.width, 25);
-        assert_eq!(rect.height, 12);
-    }
-
-    #[test]
-    fn test_scale_to_match_width_percentage() {
-        let container = Rect::_new(0, 0, 200, 100);
-        let rect = Rect::_new(0, 0, 200, 100);
-        let rect = rect.scale_to_match_width(Unit::Percentage(10.0), &container);
+        let rect = rect.scale_to_match_height(
+            Unit::Absolute(AbsoluteUnit::Percentage(10.0)),
+            &rect,
+            &container,
+        );
 
         assert_eq!(rect.width, 20);
         assert_eq!(rect.height, 10);
 
         let container = Rect::_new(0, 0, 100, 50);
         let rect = Rect::_new(0, 0, 100, 50);
-        let rect = rect.scale_to_match_width(Unit::Percentage(10.0), &container);
+        let rect = rect.scale_to_match_height(
+            Unit::Absolute(AbsoluteUnit::Percentage(10.0)),
+            &rect,
+            &container,
+        );
 
         assert_eq!(rect.width, 10);
         assert_eq!(rect.height, 5);
+    }
+
+    #[test]
+    fn test_scale_to_match_height_relative_percentage() {
+        let container = Rect::_new(0, 0, 200, 100);
+        let rect = Rect::_new(0, 0, 200, 100);
+        let rect = rect.scale_to_match_height(
+            Unit::Relative(RelativeUnit::Percentage(10.0)),
+            &rect,
+            &container,
+        );
+
+        assert_eq!(rect.width, 220);
+        assert_eq!(rect.height, 110);
+
+        let container = Rect::_new(0, 0, 100, 50);
+        let rect = Rect::_new(0, 0, 100, 50);
+        let rect = rect.scale_to_match_height(
+            Unit::Relative(RelativeUnit::Percentage(10.0)),
+            &rect,
+            &container,
+        );
+
+        assert_eq!(rect.width, 110);
+        assert_eq!(rect.height, 55);
+    }
+
+    #[test]
+    fn test_scale_to_match_height_relative_pixels() {
+        let container = Rect::_new(0, 0, 200, 100);
+        let rect = Rect::_new(0, 0, 200, 100);
+        let rect =
+            rect.scale_to_match_height(Unit::Relative(RelativeUnit::Pixels(50)), &rect, &container);
+
+        assert_eq!(rect.width, 300);
+        assert_eq!(rect.height, 150);
+
+        let container = Rect::_new(0, 0, 100, 50);
+        let rect = Rect::_new(0, 0, 100, 50);
+        let rect = rect.scale_to_match_height(
+            Unit::Relative(RelativeUnit::Pixels(200)),
+            &rect,
+            &container,
+        );
+
+        assert_eq!(rect.width, 500);
+        assert_eq!(rect.height, 250);
+    }
+
+    #[test]
+    fn test_scale_to_match_width_absolute_pixels() {
+        let container = Rect::_new(0, 0, 200, 100);
+        let rect = Rect::_new(0, 0, 200, 100);
+        let rect =
+            rect.scale_to_match_width(Unit::Absolute(AbsoluteUnit::Pixels(400)), &rect, &container);
+
+        assert_eq!(rect.width, 400);
+        assert_eq!(rect.height, 200);
+
+        let container = Rect::_new(0, 0, 100, 50);
+        let rect = Rect::_new(0, 0, 100, 50);
+        let rect =
+            rect.scale_to_match_width(Unit::Absolute(AbsoluteUnit::Pixels(25)), &rect, &container);
+
+        assert_eq!(rect.width, 25);
+        assert_eq!(rect.height, 12);
+    }
+
+    #[test]
+    fn test_scale_to_match_width_absolute_percentage() {
+        let container = Rect::_new(0, 0, 200, 100);
+        let rect = Rect::_new(0, 0, 200, 100);
+        let rect = rect.scale_to_match_width(
+            Unit::Absolute(AbsoluteUnit::Percentage(10.0)),
+            &rect,
+            &container,
+        );
+
+        assert_eq!(rect.width, 20);
+        assert_eq!(rect.height, 10);
+
+        let container = Rect::_new(0, 0, 100, 50);
+        let rect = Rect::_new(0, 0, 100, 50);
+        let rect = rect.scale_to_match_width(
+            Unit::Absolute(AbsoluteUnit::Percentage(10.0)),
+            &rect,
+            &container,
+        );
+
+        assert_eq!(rect.width, 10);
+        assert_eq!(rect.height, 5);
+    }
+
+    #[test]
+    fn test_scale_to_match_width_relative_pixels() {
+        let container = Rect::_new(0, 0, 200, 100);
+        let rect = Rect::_new(0, 0, 200, 100);
+        let rect =
+            rect.scale_to_match_width(Unit::Relative(RelativeUnit::Pixels(400)), &rect, &container);
+
+        assert_eq!(rect.width, 600);
+        assert_eq!(rect.height, 300);
+
+        let container = Rect::_new(0, 0, 100, 50);
+        let rect = Rect::_new(0, 0, 100, 50);
+        let rect =
+            rect.scale_to_match_width(Unit::Relative(RelativeUnit::Pixels(25)), &rect, &container);
+
+        assert_eq!(rect.width, 125);
+        assert_eq!(rect.height, 62);
+    }
+
+    #[test]
+    fn test_scale_to_match_width_relative_percentage() {
+        let container = Rect::_new(0, 0, 200, 100);
+        let rect = Rect::_new(0, 0, 200, 100);
+        let rect = rect.scale_to_match_width(
+            Unit::Relative(RelativeUnit::Percentage(10.0)),
+            &rect,
+            &container,
+        );
+
+        assert_eq!(rect.width, 220);
+        assert_eq!(rect.height, 110);
+
+        let container = Rect::_new(0, 0, 100, 50);
+        let rect = Rect::_new(0, 0, 100, 50);
+        let rect = rect.scale_to_match_width(
+            Unit::Relative(RelativeUnit::Percentage(10.0)),
+            &rect,
+            &container,
+        );
+
+        assert_eq!(rect.width, 110);
+        assert_eq!(rect.height, 55);
     }
 }
