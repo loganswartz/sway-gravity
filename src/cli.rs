@@ -2,7 +2,10 @@ use std::{env, path::PathBuf, sync::LazyLock};
 
 use clap::Parser;
 
-use crate::daemon::state::{Horizontal, Unit, Vertical};
+use crate::daemon::{
+    state::{Horizontal, Vertical},
+    unit::Unit,
+};
 
 /// Automatically position and resize a floating window in Sway.
 ///

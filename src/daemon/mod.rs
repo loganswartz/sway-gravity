@@ -8,7 +8,7 @@ use crate::{
         state::{PositionUpdate, StateUpdate, StateUpdateError},
         sway::SwaySubscription,
     },
-    move_window,
+    find_target_node, move_window,
     sway::SwayConnection,
     State,
 };
@@ -18,6 +18,7 @@ use swayipc::Connection;
 pub mod ipc;
 pub mod state;
 pub mod sway;
+pub mod unit;
 
 pub fn run_daemon(
     socket_path: PathBuf,
@@ -48,10 +49,16 @@ pub fn run_daemon(
                 break;
             }
             DaemonEvent::Update(update) => {
-                state.update(update);
+                let window = find_target_node(&mut con)?;
 
-                if let Err(e) = move_window(&mut con, state.clone()) {
-                    eprintln!("Failed to move window: {}", e);
+                match move_window(&mut con, window, state.clone(), update) {
+                    Ok(updated) => {
+                        state = updated;
+                        eprintln!("Window moved successfully: {:?}", state);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to move window: {}", e);
+                    }
                 };
             }
         }
@@ -84,8 +91,8 @@ impl From<Args> for StateUpdate {
         Self {
             position: PositionUpdate(args.vertical, args.horizontal),
             padding: args.padding,
-            width: Some(args.width),
-            height: Some(args.height),
+            width: args.width,
+            height: args.height,
             natural: args.natural,
         }
     }
@@ -95,6 +102,7 @@ impl From<Args> for StateUpdate {
 pub enum DaemonError {
     IoError(io::Error),
     InvalidMessage(serde_json::Error),
+    InvalidInitialState(String),
     StateUpdateFailed(StateUpdateError),
 }
 
@@ -103,6 +111,7 @@ impl Display for DaemonError {
         match self {
             DaemonError::IoError(err) => write!(f, "IO error: {}", err),
             DaemonError::InvalidMessage(err) => write!(f, "Message decoding error: {}", err),
+            DaemonError::InvalidInitialState(err) => write!(f, "Invalid initial state: {}", err),
             DaemonError::StateUpdateFailed(err) => write!(f, "State update error: {}", err),
         }
     }
@@ -113,6 +122,7 @@ impl Error for DaemonError {
         match self {
             DaemonError::IoError(err) => Some(err),
             DaemonError::InvalidMessage(err) => Some(err),
+            DaemonError::InvalidInitialState(_) => None,
             DaemonError::StateUpdateFailed(err) => Some(err),
         }
     }

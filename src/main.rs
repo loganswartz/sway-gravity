@@ -2,7 +2,7 @@ use std::{env, error::Error, fmt::Display};
 
 use clap::Parser;
 use sway::SwayConnection;
-use swayipc::NodeType;
+use swayipc::{Node, NodeType};
 
 use crate::{
     cli::Args,
@@ -10,11 +10,13 @@ use crate::{
     daemon::{
         run_daemon,
         state::{
-            AbsoluteUnit, Horizontal, Position, RelativeUnit, State, StateUpdateError, Unit,
+            Horizontal, InitialStateOptions, Position, State, StateUpdate, StateUpdateError,
             Vertical,
         },
+        unit::{AbsolutePixels, AbsoluteUnit, RelativeUnit, Unit},
         DaemonError,
     },
+    sway::{Dimension, Window},
 };
 
 mod cli;
@@ -73,9 +75,11 @@ fn submain(args: Args) -> Result<(), ApplicationError> {
     let sway_delay = args.sway_event_delay;
 
     if args.daemon {
+        let initial: InitialStateOptions = args.try_into()?;
+
         Ok(run_daemon(
             socket,
-            State::default().with(args.into()),
+            State::with_initial(initial),
             sway_delay,
         )?)
     } else {
@@ -92,28 +96,40 @@ fn main() {
     }
 }
 
-fn move_window(con: &mut SwayConnection, state: State) -> Result<(), StateUpdateError> {
+fn find_target_node(con: &mut SwayConnection) -> Result<swayipc::Node, StateUpdateError> {
     let tree = con.get_tree()?;
 
     let floating_nodes: Vec<_> = tree
         .iter()
         .filter(|node| node.node_type == NodeType::FloatingCon)
         .collect();
+
     let target_node = match floating_nodes.len() {
         1 => {
             println!("Only one floating node found, using it.");
-            floating_nodes[0]
+            let floating_node_id = floating_nodes[0].id;
+            tree.find(|node| node.id == floating_node_id)
+                .expect("Node should exist")
         }
         0 => return Err(StateUpdateError::NoApplicableNode),
         _ => tree
-            .find_focused_as_ref(|node| node.focused && node.node_type == NodeType::FloatingCon)
+            .find_focused(|node| node.focused && node.node_type == NodeType::FloatingCon)
             .ok_or(StateUpdateError::MultipleApplicableNodes)?,
     };
 
-    let working_area = con
-        .find_working_area_for(target_node.id)?
-        .map(Rect::from)
-        .ok_or(StateUpdateError::NoApplicableNode)?;
+    Ok(target_node)
+}
+
+fn move_window(
+    con: &mut SwayConnection,
+    target_node: Node,
+    mut state: State,
+    update: StateUpdate,
+) -> Result<State, StateUpdateError> {
+    let context = Window::from_node(target_node.clone(), con).map_err(StateUpdateError::SwayIPC)?;
+    state.update(update, &context);
+
+    let working_area: Rect = context.working_area.into();
     let proper_area = working_area.with_padding(state.padding as i32);
 
     let original_rect: Rect = target_node.rect.into();
@@ -130,8 +146,8 @@ fn move_window(con: &mut SwayConnection, state: State) -> Result<(), StateUpdate
         None
     };
     let scaled = &rect.scale(
-        state.width,
-        state.height,
+        state.width.clone().map(|w| w.into()),
+        state.height.clone().map(|h| h.into()),
         &original_rect,
         &proper_area,
         ratio,
@@ -139,21 +155,21 @@ fn move_window(con: &mut SwayConnection, state: State) -> Result<(), StateUpdate
 
     con.resize_node(
         target_node.id,
-        Unit::Absolute(AbsoluteUnit::Pixels(scaled.width as u32)),
-        Unit::Absolute(AbsoluteUnit::Pixels(scaled.height as u32)),
+        AbsolutePixels::from(scaled.width as u32),
+        AbsolutePixels::from(scaled.height as u32),
     )?;
 
     rect.height = scaled.height;
     rect.width = scaled.width;
 
-    let rect = proper_area.get_pos_for_rect_of_size(state.position, &rect);
+    let rect = proper_area.get_pos_for_rect_of_size(&state.position, &rect);
     // we added a padding to our working area, but the center of the new area is not the same as the
     // center of the old area, so we need to adjust the position of the window
     let final_pos = rect.translate(state.padding as i32, state.padding as i32);
 
     con.move_node_to_position(target_node.id, final_pos.x, final_pos.y)?;
 
-    Ok(())
+    Ok(state)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -244,7 +260,7 @@ impl Rect {
         rect
     }
 
-    fn get_pos_for_rect_of_size(&self, pos: Position, rect: &Rect) -> Rect {
+    fn get_pos_for_rect_of_size(&self, pos: &Position, rect: &Rect) -> Rect {
         let v_offset = match pos.0 {
             Vertical::Top => 0.0,
             Vertical::Middle => 0.5,
@@ -288,12 +304,6 @@ fn aspect_ratio(width: i32, height: i32) -> f32 {
     width as f32 / height as f32
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Dimension {
-    Width(i32),
-    Height(i32),
-}
-
 fn scale_to_ratio(dimension: Dimension, ratio: f32) -> Dimension {
     if ratio == 0.0 {
         return match dimension {
@@ -310,14 +320,14 @@ fn scale_to_ratio(dimension: Dimension, ratio: f32) -> Dimension {
 
 fn unit_to_real_pixels(unit: Unit, target_px: i32, container_px: i32) -> i32 {
     let real = match unit {
-        Unit::Absolute(AbsoluteUnit::Pixels(pixels)) => pixels as f32,
+        Unit::Absolute(AbsoluteUnit::Pixels(pixels)) => pixels.0 as f32,
         Unit::Absolute(AbsoluteUnit::Percentage(percentage)) => {
-            container_px as f32 * (percentage / 100.0)
+            container_px as f32 * (percentage.0 / 100.0)
         }
-        Unit::Relative(RelativeUnit::Pixels(pixels)) => target_px.saturating_add(pixels) as f32,
+        Unit::Relative(RelativeUnit::Pixels(pixels)) => target_px.saturating_add(pixels.0) as f32,
         Unit::Relative(RelativeUnit::Percentage(percentage)) => {
             let current = target_px as f32 / container_px as f32;
-            let adjusted = current + (percentage / 100.0);
+            let adjusted = current + (percentage.0 / 100.0);
             container_px as f32 * adjusted
         }
     };
@@ -327,6 +337,8 @@ fn unit_to_real_pixels(unit: Unit, target_px: i32, container_px: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::daemon::unit::{AbsolutePercentage, RelativePercentage, RelativePixels};
+
     use super::*;
 
     #[test]
@@ -346,7 +358,7 @@ mod tests {
         let window = Rect::_new(0, 0, 33, 33);
 
         let pos = Position(Vertical::Top, Horizontal::Left);
-        let rect = workspace.get_pos_for_rect_of_size(pos, &window);
+        let rect = workspace.get_pos_for_rect_of_size(&pos, &window);
 
         assert_eq!(rect.x, 0);
         assert_eq!(rect.y, 0);
@@ -354,7 +366,7 @@ mod tests {
         assert_eq!(rect.height, 33);
 
         let pos = Position(Vertical::Middle, Horizontal::Middle);
-        let rect = workspace.get_pos_for_rect_of_size(pos, &window);
+        let rect = workspace.get_pos_for_rect_of_size(&pos, &window);
 
         assert_eq!(rect.x, 33);
         assert_eq!(rect.y, 33);
@@ -362,7 +374,7 @@ mod tests {
         assert_eq!(rect.height, 33);
 
         let pos = Position(Vertical::Bottom, Horizontal::Right);
-        let rect = workspace.get_pos_for_rect_of_size(pos, &window);
+        let rect = workspace.get_pos_for_rect_of_size(&pos, &window);
 
         assert_eq!(rect.x, 67);
         assert_eq!(rect.y, 67);
@@ -376,7 +388,7 @@ mod tests {
         let rect = Rect::_new(0, 0, 200, 100);
         let rect = rect.scale(
             None,
-            Some(Unit::Absolute(AbsoluteUnit::Pixels(50))),
+            Some(AbsolutePixels(50).into()),
             &rect,
             &container,
             None,
@@ -389,7 +401,7 @@ mod tests {
         let rect = Rect::_new(0, 0, 100, 50);
         let rect = rect.scale(
             None,
-            Some(Unit::Absolute(AbsoluteUnit::Pixels(200))),
+            Some(AbsolutePixels(200).into()),
             &rect,
             &container,
             None,
@@ -405,7 +417,7 @@ mod tests {
         let rect = Rect::_new(0, 0, 200, 100);
         let rect = rect.scale(
             None,
-            Some(Unit::Absolute(AbsoluteUnit::Percentage(10.0))),
+            Some(AbsolutePercentage(10.0).into()),
             &rect,
             &container,
             None,
@@ -418,7 +430,7 @@ mod tests {
         let rect = Rect::_new(0, 0, 100, 50);
         let rect = rect.scale(
             None,
-            Some(Unit::Absolute(AbsoluteUnit::Percentage(10.0))),
+            Some(AbsolutePercentage(10.0).into()),
             &rect,
             &container,
             None,
@@ -434,7 +446,7 @@ mod tests {
         let rect = Rect::_new(0, 0, 200, 100);
         let rect = rect.scale(
             None,
-            Some(Unit::Relative(RelativeUnit::Percentage(10.0))),
+            Some(RelativePercentage(10.0).into()),
             &rect,
             &container,
             None,
@@ -447,7 +459,7 @@ mod tests {
         let rect = Rect::_new(0, 0, 100, 50);
         let rect = rect.scale(
             None,
-            Some(Unit::Relative(RelativeUnit::Percentage(10.0))),
+            Some(RelativePercentage(10.0).into()),
             &rect,
             &container,
             None,
@@ -463,7 +475,7 @@ mod tests {
         let rect = Rect::_new(0, 0, 200, 100);
         let rect = rect.scale(
             None,
-            Some(Unit::Relative(RelativeUnit::Pixels(50))),
+            Some(RelativePixels(50).into()),
             &rect,
             &container,
             None,
@@ -476,7 +488,7 @@ mod tests {
         let rect = Rect::_new(0, 0, 100, 50);
         let rect = rect.scale(
             None,
-            Some(Unit::Relative(RelativeUnit::Pixels(200))),
+            Some(RelativePixels(200).into()),
             &rect,
             &container,
             None,
@@ -491,7 +503,7 @@ mod tests {
         let container = Rect::_new(0, 0, 200, 100);
         let rect = Rect::_new(0, 0, 200, 100);
         let rect = rect.scale(
-            Some(Unit::Absolute(AbsoluteUnit::Pixels(400))),
+            Some(AbsolutePixels(400).into()),
             None,
             &rect,
             &container,
@@ -504,7 +516,7 @@ mod tests {
         let container = Rect::_new(0, 0, 100, 50);
         let rect = Rect::_new(0, 0, 100, 50);
         let rect = rect.scale(
-            Some(Unit::Absolute(AbsoluteUnit::Pixels(25))),
+            Some(AbsolutePixels(25).into()),
             None,
             &rect,
             &container,
@@ -520,7 +532,7 @@ mod tests {
         let container = Rect::_new(0, 0, 200, 100);
         let rect = Rect::_new(0, 0, 200, 100);
         let rect = rect.scale(
-            Some(Unit::Absolute(AbsoluteUnit::Percentage(10.0))),
+            Some(AbsolutePercentage(10.0).into()),
             None,
             &rect,
             &container,
@@ -533,7 +545,7 @@ mod tests {
         let container = Rect::_new(0, 0, 100, 50);
         let rect = Rect::_new(0, 0, 100, 50);
         let rect = rect.scale(
-            Some(Unit::Absolute(AbsoluteUnit::Percentage(10.0))),
+            Some(AbsolutePercentage(10.0).into()),
             None,
             &rect,
             &container,
@@ -549,7 +561,7 @@ mod tests {
         let container = Rect::_new(0, 0, 200, 100);
         let rect = Rect::_new(0, 0, 200, 100);
         let rect = rect.scale(
-            Some(Unit::Relative(RelativeUnit::Pixels(400))),
+            Some(RelativePixels(400).into()),
             None,
             &rect,
             &container,
@@ -562,7 +574,7 @@ mod tests {
         let container = Rect::_new(0, 0, 100, 50);
         let rect = Rect::_new(0, 0, 100, 50);
         let rect = rect.scale(
-            Some(Unit::Relative(RelativeUnit::Pixels(25))),
+            Some(RelativePixels(25).into()),
             None,
             &rect,
             &container,
@@ -578,7 +590,7 @@ mod tests {
         let container = Rect::_new(0, 0, 200, 100);
         let rect = Rect::_new(0, 0, 200, 100);
         let rect = rect.scale(
-            Some(Unit::Relative(RelativeUnit::Percentage(10.0))),
+            Some(RelativePercentage(10.0).into()),
             None,
             &rect,
             &container,
@@ -591,7 +603,7 @@ mod tests {
         let container = Rect::_new(0, 0, 100, 50);
         let rect = Rect::_new(0, 0, 100, 50);
         let rect = rect.scale(
-            Some(Unit::Relative(RelativeUnit::Percentage(10.0))),
+            Some(RelativePercentage(10.0).into()),
             None,
             &rect,
             &container,
@@ -648,19 +660,19 @@ mod tests {
     #[test]
     fn test_unit_to_real_pixels() {
         assert_eq!(
-            unit_to_real_pixels(Unit::Absolute(AbsoluteUnit::Pixels(100)), 200, 1000),
+            unit_to_real_pixels(AbsolutePixels(100).into(), 200, 1000),
             100
         );
         assert_eq!(
-            unit_to_real_pixels(Unit::Absolute(AbsoluteUnit::Percentage(50.0)), 200, 1000),
+            unit_to_real_pixels(AbsolutePercentage(50.0).into(), 200, 1000),
             500
         );
         assert_eq!(
-            unit_to_real_pixels(Unit::Relative(RelativeUnit::Pixels(-50)), 200, 1000),
+            unit_to_real_pixels(RelativePixels(-50).into(), 200, 1000),
             150
         );
         assert_eq!(
-            unit_to_real_pixels(Unit::Relative(RelativeUnit::Percentage(50.0)), 250, 1000),
+            unit_to_real_pixels(RelativePercentage(50.0).into(), 250, 1000),
             750
         );
     }

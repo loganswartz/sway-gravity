@@ -1,20 +1,71 @@
-use std::{error::Error, fmt::Display, num::ParseIntError};
+use std::error::Error;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use swayipc::Error as SwayIPCError;
 
+use crate::{
+    cli::Args,
+    daemon::{
+        unit::{AbsolutePixels, AbsoluteUnit, Unit},
+        DaemonError,
+    },
+    sway::Window,
+};
+
+pub struct InitialStateOptions {
+    pub position: PositionUpdate,
+    pub padding: Option<u32>,
+    pub width: Option<AbsoluteUnit>,
+    pub height: Option<AbsoluteUnit>,
+    pub natural: Option<bool>,
+}
+
+impl TryFrom<Args> for InitialStateOptions {
+    type Error = DaemonError;
+
+    fn try_from(args: Args) -> Result<Self, Self::Error> {
+        let width = match args.width {
+            Some(Unit::Absolute(width)) => Some(width),
+            Some(Unit::Relative(_)) => {
+                return Err(DaemonError::InvalidInitialState(
+                    "The initial width must not be a relative value".to_string(),
+                ))
+            }
+            None => None,
+        };
+
+        let height = match args.height {
+            Some(Unit::Absolute(height)) => Some(height),
+            Some(Unit::Relative(_)) => {
+                return Err(DaemonError::InvalidInitialState(
+                    "The initial height must not be a relative value".to_string(),
+                ))
+            }
+            None => None,
+        };
+
+        Ok(Self {
+            position: PositionUpdate(args.vertical, args.horizontal),
+            padding: args.padding,
+            width,
+            height,
+            natural: args.natural,
+        })
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct State {
     pub position: Position,
     pub padding: u32,
-    pub width: Option<Unit>,
-    pub height: Option<Unit>,
+    pub width: Option<AbsoluteUnit>,
+    pub height: Option<AbsoluteUnit>,
     pub natural: bool,
 }
 
 impl State {
-    pub fn update(&mut self, update: StateUpdate) {
+    pub fn update(&mut self, update: StateUpdate, context: &Window) {
         self.position.update(update.position);
         if let Some(padding) = update.padding {
             self.padding = padding;
@@ -23,28 +74,51 @@ impl State {
             self.natural = natural;
         }
 
+        let default_width = AbsolutePixels::from(context.dimensions.width as u32).into();
+        let default_height = AbsolutePixels::from(context.dimensions.height as u32).into();
+
+        let parent_width: AbsolutePixels = (context.working_area.width as u32).into();
+        let parent_height: AbsolutePixels = (context.working_area.height as u32).into();
+
         // If only one dimension is provided, we probably want to set the other to None
         match (update.width, update.height) {
             (Some(width), Some(height)) => {
-                self.width = width;
-                self.height = height;
+                self.width = Some(
+                    width.to_absolute(self.width.clone().unwrap_or(default_width), parent_width),
+                );
+                self.height = Some(
+                    height
+                        .to_absolute(self.height.clone().unwrap_or(default_height), parent_height),
+                );
             }
             (Some(width), None) => {
-                self.width = width;
+                self.width = Some(
+                    width.to_absolute(self.width.clone().unwrap_or(default_width), parent_width),
+                );
                 self.height = None;
             }
             (None, Some(height)) => {
                 self.width = None;
-                self.height = height;
+                self.height = Some(
+                    height
+                        .to_absolute(self.height.clone().unwrap_or(default_height), parent_height),
+                );
             }
             _ => {}
         }
     }
 
-    pub fn with(self, update: StateUpdate) -> Self {
-        let mut new_state = self.clone();
-        new_state.update(update);
-        new_state
+    pub fn with_initial(initial: InitialStateOptions) -> Self {
+        Self {
+            position: Position(
+                initial.position.0.unwrap_or_default(),
+                initial.position.1.unwrap_or_default(),
+            ),
+            padding: initial.padding.unwrap_or_default(),
+            width: initial.width,
+            height: initial.height,
+            natural: initial.natural.unwrap_or_default(),
+        }
     }
 }
 
@@ -96,133 +170,6 @@ impl Position {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Unit {
-    /// A relative dimension, which can be a percentage or a pixel value (ex: `+100px` or `-5%`)
-    Relative(RelativeUnit),
-    /// An absolute dimension, which can be a percentage or a pixel value (ex: `100px` or `33.333%`)
-    Absolute(AbsoluteUnit),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AbsoluteUnit {
-    /// A dimension in pixels (ex: `100` or `100px`)
-    Pixels(u32),
-    /// A dimension as a percentage (ex: `33.333%`)
-    Percentage(f32),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RelativeUnit {
-    /// A relative dimension in pixels (ex: `+100` or `-100px`)
-    Pixels(i32),
-    /// A dimension as a percentage (ex: `-5%`)
-    Percentage(f32),
-}
-
-#[derive(Debug, Clone)]
-pub enum ParseUnitError {
-    ParseIntError(ParseIntError),
-    ParseFloatError(std::num::ParseFloatError),
-}
-
-impl Display for ParseUnitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ParseUnitError::ParseIntError(err) => write!(f, "ParseIntError: {}", err),
-            ParseUnitError::ParseFloatError(err) => write!(f, "ParseFloatError: {}", err),
-        }
-    }
-}
-
-impl Error for ParseUnitError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            ParseUnitError::ParseIntError(err) => Some(err),
-            ParseUnitError::ParseFloatError(err) => Some(err),
-        }
-    }
-}
-
-impl From<ParseIntError> for ParseUnitError {
-    fn from(err: ParseIntError) -> Self {
-        Self::ParseIntError(err)
-    }
-}
-
-impl From<std::num::ParseFloatError> for ParseUnitError {
-    fn from(err: std::num::ParseFloatError) -> Self {
-        Self::ParseFloatError(err)
-    }
-}
-
-impl std::str::FromStr for Unit {
-    type Err = ParseUnitError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.starts_with(['-', '+']) {
-            Ok(Self::Relative(s.parse()?))
-        } else {
-            Ok(Self::Absolute(s.parse()?))
-        }
-    }
-}
-
-impl std::fmt::Display for Unit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Relative(value) => write!(f, "{}", value),
-            Self::Absolute(value) => write!(f, "{}", value),
-        }
-    }
-}
-
-impl std::str::FromStr for RelativeUnit {
-    type Err = ParseUnitError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Some(value) = s.strip_suffix("%") {
-            Ok(Self::Percentage(value.parse()?))
-        } else {
-            // Default to pixels if no suffix is provided
-            let value = s.strip_suffix("px").unwrap_or(s);
-            Ok(Self::Pixels(value.parse()?))
-        }
-    }
-}
-
-impl std::fmt::Display for RelativeUnit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Pixels(value) => write!(f, "{} px", value),
-            Self::Percentage(value) => write!(f, "{} ppt", value),
-        }
-    }
-}
-
-impl std::str::FromStr for AbsoluteUnit {
-    type Err = ParseUnitError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Some(value) = s.strip_suffix("%") {
-            Ok(Self::Percentage(value.parse()?))
-        } else {
-            // Default to pixels if no suffix is provided
-            let value = s.strip_suffix("px").unwrap_or(s);
-            Ok(Self::Pixels(value.parse()?))
-        }
-    }
-}
-
-impl std::fmt::Display for AbsoluteUnit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Pixels(value) => write!(f, "{} px", value),
-            Self::Percentage(value) => write!(f, "{} ppt", value),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PositionUpdate(pub Option<Vertical>, pub Option<Horizontal>);
 
@@ -236,8 +183,8 @@ impl From<Position> for PositionUpdate {
 pub struct StateUpdate {
     pub position: PositionUpdate,
     pub padding: Option<u32>,
-    pub width: Option<Option<Unit>>,
-    pub height: Option<Option<Unit>>,
+    pub width: Option<Unit>,
+    pub height: Option<Unit>,
     pub natural: Option<bool>,
 }
 
@@ -246,8 +193,8 @@ impl From<State> for StateUpdate {
         Self {
             position: state.position.into(),
             padding: Some(state.padding),
-            width: Some(state.width),
-            height: Some(state.height),
+            width: state.width.map(Unit::Absolute),
+            height: state.height.map(Unit::Absolute),
             natural: Some(state.natural),
         }
     }
